@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+
+# Model weights & checkpoints
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.bin
+expert/root/model/
+train_*/save/
+
+# Datasets & synthetic data
+expert/root/cifar-10-batches-py/
+expert/root/cifar-100-python/
+expert/root/tiny-imagenet-200/
+expert/root/imagenet/
+expert/root/*.tar.gz
+expert/root/*.tar
+expert/root/*.zip
+initial/exp/
+recover_*/syn_data_50/
+recover_*/statistic/
+
+# Logs & experiment outputs
+train_*/wandb/
+wandb/
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
