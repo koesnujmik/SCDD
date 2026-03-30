@@ -30,6 +30,7 @@ recover_*/statistic/
 train_*/wandb/
 wandb/
 *.log
+log.txt
 
 # IDE
 .vscode/

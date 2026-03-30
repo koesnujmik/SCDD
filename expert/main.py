@@ -197,7 +197,9 @@ if __name__ == '__main__':
     parser.add_argument('--wd', '--weight_decay', default=5e-3, type=float, metavar='W',help='weight decay (default: 5e-3、2e-4、1e-4)', dest='weight_decay')
     parser.add_argument('--resample_weighting', default=0.2, type=float,help='weighted for sampling probability (q(1,k))')
     parser.add_argument('--q', default=0.8, type=float, help='sharpness of weighting')
-    parser.add_argument('--gamma1', default=1,type=int,help='weight for L_robust')
+    parser.add_argument('--gamma1', default=1, type=float, help='weight for L_robust (SimSiam)')
+    parser.add_argument('--gamma2', default=0.5, type=float, help='weight for L_supcon (SupCon)')
+    parser.add_argument('--temperature', default=0.1, type=float, help='SupCon temperature τ')
     parser.add_argument('--dir_train_txt',default='', type=str)
     parser.add_argument('--dir_test_txt',default='', type=str)
     # etc.

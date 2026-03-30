@@ -32,6 +32,8 @@ class Trainer(object):
         self.per_cls_weights = None
         self.cls_num_list = per_class_num
         self.gamma1 = args.gamma1
+        self.gamma2 = args.gamma2
+        self.temperature = args.temperature
         self.model = model
         self.optimizer = torch.optim.SGD(self.model.parameters(), momentum=0.9, lr=self.lr,weight_decay=args.weight_decay)
         self.train_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.epochs)
@@ -107,7 +109,7 @@ class Trainer(object):
 
                 output_1, output_cb_1, z1, p1 = self.model(mix_x, train=True)
                 output_2, output_cb_2, z2, p2 = self.model(cut_x, train=True)
-                contrastive_loss = self.SimSiamLoss(p1, z2) + self.SimSiamLoss(p2, z1) # L_robust
+                robust_loss = self.SimSiamLoss(p1, z2) + self.SimSiamLoss(p2, z1)  # L_robust
 
                 loss_mix = -torch.mean(torch.sum(F.log_softmax(output_1, dim=1) * mixup_y, dim=1))
                 loss_cut = -torch.mean(torch.sum(F.log_softmax(output_2, dim=1) * mixcut_y, dim=1))
@@ -117,7 +119,18 @@ class Trainer(object):
                 balance_loss = loss_mix + loss_cut
                 rebalance_loss = loss_mix_w + loss_cut_w
 
-                loss = alpha * balance_loss + (1 - alpha) * rebalance_loss + self.gamma1 * contrastive_loss
+                # SupCon: 원본 view + balanced sampler 샘플 concat → 1회 forward
+                n = input_org_1.size(0)
+                supcon_input = torch.cat([input_org_1, input_org_2, input_invs_1, input_invs_2], dim=0)
+                _, _, z_supcon, _ = self.model(supcon_input, train=True)
+                supcon_labels = torch.cat([
+                    target_org, target_org,
+                    target_invs[:n], target_invs[:n],
+                ], dim=0).cuda()
+                supcon_loss = self.SupConLoss(z_supcon, supcon_labels)  # L_supcon
+
+                loss = (alpha * balance_loss + (1 - alpha) * rebalance_loss
+                        + self.gamma1 * robust_loss + self.gamma2 * supcon_loss)
 
                 losses.update(loss.item(), inputs[0].size(0))
 
@@ -217,6 +230,39 @@ class Trainer(object):
                   float(sum(cls_acc[few_shot]) * 100 / (sum(few_shot) + eps))
                   )
         return top1.avg
+
+    def SupConLoss(self, features, labels):
+        """Supervised Contrastive Loss (Khosla et al., 2020).
+        features: [N, dim] unnormalized
+        labels:   [N]
+        같은 클래스 sample끼리 끌어당기고, 다른 클래스는 밀어냄.
+        """
+        features = F.normalize(features, dim=1)
+        N = features.shape[0]
+        device = features.device
+
+        sim = torch.matmul(features, features.T) / self.temperature  # [N, N]
+
+        # numerical stability
+        sim_max, _ = sim.max(dim=1, keepdim=True)
+        sim = sim - sim_max.detach()
+
+        mask_self = torch.eye(N, dtype=torch.bool, device=device)
+
+        # positive mask: 같은 클래스이면서 자기 자신이 아닌 pair
+        labels = labels.view(-1, 1)
+        mask_pos = (labels == labels.T).float().masked_fill(mask_self, 0)
+
+        # inplace 사용 금지 (gradient graph 오염 방지)
+        exp_sim = torch.exp(sim) * (~mask_self).float()
+        log_prob = sim - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-8)
+
+        num_pos = mask_pos.sum(dim=1)
+        valid = num_pos > 0  # positive pair가 없는 anchor는 제외
+        mean_log_prob_pos = (mask_pos * log_prob).sum(dim=1) / (num_pos + 1e-8)
+
+        loss = -mean_log_prob_pos[valid].mean()
+        return loss
 
     def SimSiamLoss(self,p, z, version='simplified'):  # negative cosine similarity
         z = z.detach()  # stop gradient

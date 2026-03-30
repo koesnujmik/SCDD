@@ -47,6 +47,8 @@ class ConvNet(nn.Module):
         )
         self.projection_head = nn.Sequential(
             nn.Linear(num_feat, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
         )
 
     def forward(self, x, train=False):
