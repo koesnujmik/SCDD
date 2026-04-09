@@ -165,6 +165,12 @@ parser.add_argument(
     type=str,
     help="name of the experiment, subfolder under syn_data_path",
 )
+parser.add_argument(
+    "--pre-train-path",
+    type=str,
+    default="../expert/root/model/dataset: cifar10#arch: convnet#imbanlance_rate: 0.01#2026-03-27 21:25:57/ckpt.best.pth.tar",
+    help="path to the pretrained expert model checkpoint",
+)
 args = parser.parse_args()
 
 
@@ -268,7 +274,7 @@ if args.re_accum_steps != 1:
     args.re_batch_size = int(args.re_batch_size / args.re_accum_steps)
 
 # result dir for saving
-args.exp_name = f"{args.subset}_{args.arch_name}_{args.selection_method}_f{args.factor}_mipc{args.mipc}_ipc{args.ipc}_cr{args.num_crop}"
+args.exp_name = f"{args.exp_name}{args.subset}_{args.arch_name}_{args.selection_method}_f{args.factor}_mipc{args.mipc}_ipc{args.ipc}_cr{args.num_crop}"
 if not os.path.exists(f"./exp/{args.exp_name}"):
     os.makedirs(f"./exp/{args.exp_name}")
 args.syn_data_path = os.path.join("./exp/" + args.exp_name, args.syn_data_path)
