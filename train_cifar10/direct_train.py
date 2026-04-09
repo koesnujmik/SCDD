@@ -4,6 +4,7 @@ import math
 import time
 import shutil
 import argparse
+import faulthandler
 import ResNet_cifar
 from convnet import ConvNet
 import numpy as np
@@ -26,6 +27,8 @@ import torch.multiprocessing as mp
 from prefetch_generator import BackgroundGenerator
 from torch.utils.data import DataLoader
 from utils import AverageMeter, accuracy, get_parameters
+
+faulthandler.enable(all_threads=True)
 
 
 normalize = transforms.Normalize([0.5071, 0.4867, 0.4408],
@@ -271,11 +274,19 @@ def main():
     args = get_args()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+    ngpus_per_node = torch.cuda.device_count()
+    if ngpus_per_node < 1:
+        raise RuntimeError("No CUDA device is visible. Check CUDA_VISIBLE_DEVICES and the NVIDIA driver state.")
+    args.world_size = ngpus_per_node * args.world_size
+    if ngpus_per_node == 1:
+        print("Single visible GPU detected, skipping distributed spawn.")
+        args.distributed = False
+        main_worker(0, ngpus_per_node, args)
+        return
+
     port_id = 10002 + np.random.randint(0, 1000)
     args.dist_url = 'tcp://127.0.0.1:' + str(port_id)
     args.distributed = True
-    ngpus_per_node = torch.cuda.device_count()
-    args.world_size = ngpus_per_node * args.world_size
     torch.multiprocessing.set_start_method('spawn')
     mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
 
@@ -283,13 +294,17 @@ def main():
 def main_worker(gpu, ngpus_per_node, args):
     wandb.login(key=args.wandb_api_key)
     wandb.init(project=args.wandb_project, name=args.output_dir.split('/')[-1])
-    args.rank = gpu
-    dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
-                            world_size=args.world_size, rank=args.rank)
+    if args.distributed:
+        args.rank = gpu
+        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+                                world_size=args.world_size, rank=args.rank)
+    else:
+        args.rank = 0
     if not torch.cuda.is_available():
         raise Exception("need gpu to train!")
 
-    assert os.path.exists(args.train_dir)
+    if not os.path.isdir(args.train_dir):
+        raise FileNotFoundError(f"Training directory does not exist: {args.train_dir}")
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
@@ -459,6 +474,8 @@ def main_worker(gpu, ngpus_per_node, args):
         }, is_best, output_dir=args.output_dir)
 
     wandb.finish()
+    if args.distributed and dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def adjust_bn_momentum(model, iters):
