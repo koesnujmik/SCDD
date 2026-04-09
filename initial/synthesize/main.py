@@ -120,7 +120,7 @@ def main(args):
             model = convnet3(nclass=10)
         else:
             model = convnet3(nclass=100)
-        checkpoint = torch.load("../expert/root/model/dataset: cifar10#arch: convnet#imbanlance_rate: 0.01#2026-03-27 21:25:57/ckpt.best.pth.tar", map_location='cuda')
+        checkpoint = torch.load(args.pre_train_path, map_location='cuda')
         # checkpoint = torch.load("",map_location="cpu")
         
         checkpoint = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint

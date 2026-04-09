@@ -25,6 +25,7 @@ expert/root/*.zip
 initial/exp/
 recover_*/syn_data_50/
 recover_*/statistic/
+recover_*/biased_statistic/
 
 # Logs & experiment outputs
 train_*/wandb/
