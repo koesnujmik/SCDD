@@ -116,7 +116,7 @@ class EMA(object):
 
 class BNFeatureHook():
     def __init__(self, module, save_path="./", training_momentum=0.4, name=None, gpu=0, flatness_weight=0,
-                      category_aware = 'global'):
+                      category_aware = 'global', class_num_list=None):
         self.module = module
         if module is not None and name is not None:
             self.hook = module.register_forward_hook(self.post_hook_fn)
@@ -129,6 +129,12 @@ class BNFeatureHook():
         self.tea_tag = False
         self.return_tag = False
         self.flatness_weight = flatness_weight
+        # Sub-component losses for logging
+        self.loss_global_mean = torch.tensor(0.)
+        self.loss_global_var = torch.tensor(0.)
+        self.loss_class_mean = torch.tensor(0.)
+        self.loss_class_var = torch.tensor(0.)
+        
         for i in range(10):
             cls_dir = os.path.join(save_path, f"BNFeatureHook", f"class_{i}", name)
             if not os.path.exists(cls_dir):
@@ -140,6 +146,15 @@ class BNFeatureHook():
         self.category_running_dd_mean_list = [0. for i in range(10)]
         self.load_tag = True
         self.category_aware = category_aware
+        
+        if class_num_list is not None:
+            n = torch.tensor(class_num_list, dtype=torch.float)
+            n_min, n_max = n.min(), n.max()
+            alpha = (n - n_min) / (n_max - n_min)
+            self.alpha_per_class = alpha.cuda(gpu)
+        else:
+            self.alpha_per_class = None
+        
         if category_aware == "global":
             for i, category_save_path in enumerate(self.category_save_path_list):
                 if os.path.exists(category_save_path):
@@ -190,6 +205,8 @@ class BNFeatureHook():
                         "running_dd_mean": self.category_running_dd_mean_list[i].cpu().numpy() if isinstance(self.category_running_dd_mean_list[i],
                                                                                         torch.Tensor) else self.category_running_dd_mean_list[i]}
             np.savez(category_save_path, **npz_file)
+        self.category_running_dd_var_list = torch.stack(self.category_running_dd_var_list, 0)
+        self.category_running_dd_mean_list = torch.stack(self.category_running_dd_mean_list, 0)
 
     @torch.no_grad()
     def pre_hook_fn(self, module, input, output):
@@ -221,42 +238,36 @@ class BNFeatureHook():
                 else:
                     self.dd_var = self.momentum * self.dd_var + (1 - self.momentum) * var
                     self.dd_mean = self.momentum * self.dd_mean + (1 - self.momentum) * mean
-            r_feature = (torch.norm(module.running_var.data - (self.dd_var + var - var.detach()), 2) + \
-                        torch.norm(module.running_mean.data - (self.dd_mean + mean - mean.detach()), 2)) * 0.5
-            category_dd_var = self.category_running_dd_var_list[self.targets.long()].mean(0)
-            category_dd_mean = self.category_running_dd_mean_list[self.targets.long()].mean(0)
-            r_feature += (torch.norm(category_dd_var - (self.dd_var + var - var.detach()), 2) + \
-                        torch.norm(category_dd_mean - (self.dd_mean + mean - mean.detach()), 2)) * 0.5
+            syn_mean = self.dd_mean + mean - mean.detach()
+            syn_var = self.dd_var + var - var.detach()
+            loss_global_mean = torch.norm(module.running_mean.data - syn_mean, 2)
+            loss_global_var = torch.norm(module.running_var.data - syn_var, 2)
+            
+            if self.alpha_per_class is not None:
+                batch_cls = self.targets.long()
+                mean_alpha = self.alpha_per_class[batch_cls].mean()
+                unique_cls = batch_cls.unique()
+                loss_class_mean = sum((1 - self.alpha_per_class[c]) * torch.norm(self.category_running_dd_mean_list[c] - syn_mean, 2) for c in unique_cls) / len(unique_cls)
+                loss_class_var = sum((1 - self.alpha_per_class[c]) * torch.norm(self.category_running_dd_var_list[c] - syn_var, 2) for c in unique_cls) / len(unique_cls)
+                r_feature = (loss_global_mean + loss_global_var) * mean_alpha + loss_class_mean + loss_class_var
+            else:
+                category_dd_var = self.category_running_dd_var_list[self.targets.long()].mean(0)
+                category_dd_mean = self.category_running_dd_mean_list[self.targets.long()].mean(0)
+                loss_class_mean = torch.norm(category_dd_mean - syn_mean, 2)
+                loss_class_var = torch.norm(category_dd_var - syn_var, 2)
+                
+                category_dd_var = self.category_running_dd_var_list[self.targets.long()].mean(0)
+                category_dd_mean = self.category_running_dd_mean_list[self.targets.long()].mean(0)
+                r_feature = (loss_global_var + loss_global_mean) * 0.5 + (loss_class_var + loss_class_mean) * 0.5
+            
+            self.loss_global_mean = loss_global_mean.detach()
+            self.loss_global_var = loss_global_var.detach()
+            self.loss_class_mean = loss_class_mean.detach() if isinstance(loss_class_mean, torch.Tensor) else torch.tensor(float(loss_class_mean))
+            self.loss_class_var = loss_class_var.detach() if isinstance(loss_class_var, torch.Tensor) else torch.tensor(float(loss_class_var))
+            
             self.r_feature = r_feature
         else:
-            if self.tea_tag:
-                nch = input[0].shape[1]
-                bs = input[0].shape[0]
-                input_0 = input[0]
-                mean = input_0.mean([0, 2, 3])
-                var = (input_0.permute(1, 0, 2, 3).contiguous().reshape([nch, -1])).var(1, unbiased=False)
-                self.category_running_dd_var_list = var
-                self.category_running_dd_mean_list = mean
-            else:
-                nch = input[0].shape[1]
-                bs = input[0].shape[0]
-                input_0 = input[0]
-                mean = input_0.mean([0, 2, 3])
-                var = (input_0.permute(1, 0, 2, 3).contiguous().reshape([nch, -1])).var(1, unbiased=False)
-                with torch.no_grad():
-                    if isinstance(self.dd_var, int):
-                        self.dd_var = var
-                        self.dd_mean = mean
-                    else:
-                        self.dd_var = self.momentum * self.dd_var + (1 - self.momentum) * var
-                        self.dd_mean = self.momentum * self.dd_mean + (1 - self.momentum) * mean
-                r_feature = (torch.norm(module.running_var.data - (self.dd_var + var - var.detach()), 2) + \
-                            torch.norm(module.running_mean.data - (self.dd_mean + mean - mean.detach()), 2)) * 0.5
-                category_dd_var = self.category_running_dd_var_list
-                category_dd_mean = self.category_running_dd_mean_list
-                r_feature += (torch.norm(category_dd_var - (self.dd_var + var - var.detach()), 2) + \
-                            torch.norm(category_dd_mean - (self.dd_mean + mean - mean.detach()), 2)) * 0.5
-                self.r_feature = r_feature
+            raise NotImplementedError("local category-aware is not implemented yet!")
             
     def close(self):
         self.hook.remove()
@@ -266,7 +277,7 @@ import collections
 
 class ConvFeatureHook():
     def __init__(self, module=None, save_path="./", data_number=50000, name=None, gpu=0, training_momentum=0.4,
-                 drop_rate=0.4, flatness_weight=0, category_aware = 'global'):
+                 drop_rate=0.4, flatness_weight=0, category_aware = 'global', class_num_list=None):
         self.counter = collections.defaultdict(int)
         self.module = module
         if module is not None and name is not None:
@@ -281,6 +292,13 @@ class ConvFeatureHook():
         self.flatness_weight = flatness_weight
         self.momentum = training_momentum  # origin = 0.2
         self.drop_rate = drop_rate  # 0.0 0.4 0.8
+        
+        # Sub-component losses for logging
+        self.loss_global_mean = torch.tensor(0.)
+        self.loss_global_var = torch.tensor(0.)
+        self.loss_class_mean = torch.tensor(0.)
+        self.loss_class_var = torch.tensor(0.)
+        
         dir = os.path.join(save_path, "ConvFeatureHook", name)
         if not os.path.exists(dir):
             os.makedirs(dir, exist_ok=True)
@@ -303,6 +321,15 @@ class ConvFeatureHook():
             self.running_patch_mean = 0.
 
         self.category_aware = category_aware
+        
+        if class_num_list is not None:
+            n = torch.tensor(class_num_list, dtype=torch.float)
+            n_min, n_max = n.min(), n.max()
+            alpha = 1 - ((n - n_min) / (n_max - n_min))  # tail→1, head→0 (reverse)
+            self.alpha_per_class = alpha.cuda(gpu)
+        else:
+            self.alpha_per_class = None
+        
         if category_aware == "global":
             self.category_save_path_list = [
                 os.path.join(save_path, f"ConvFeatureHook", f"class_{i}", name, "running.npz") for i in range(10)
@@ -369,11 +396,15 @@ class ConvFeatureHook():
                                                                                       torch.Tensor) else self.category_running_dd_var_list[i],
                         "running_dd_mean": self.category_running_dd_mean_list[i].cpu().numpy() if isinstance(self.category_running_dd_mean_list[i],
                                                                                         torch.Tensor) else self.category_running_dd_mean_list[i],
-                        "running_patch_var": self.category_running_patch_mean_list[i].cpu().numpy() if isinstance(self.category_running_patch_mean_list[i],
+                        "running_patch_mean": self.category_running_patch_mean_list[i].cpu().numpy() if isinstance(self.category_running_patch_mean_list[i],
                                                                                             torch.Tensor) else self.category_running_patch_mean_list[i],
-                        "running_patch_mean": self.category_running_patch_var_list[i].cpu().numpy() if isinstance(self.category_running_patch_var_list[i],
+                        "running_patch_var": self.category_running_patch_var_list[i].cpu().numpy() if isinstance(self.category_running_patch_var_list[i],
                                                                                               torch.Tensor) else self.category_running_patch_var_list[i]}
             np.savez(category_save_path, **npz_file)
+        self.category_running_dd_var_list = torch.stack(self.category_running_dd_var_list, 0)
+        self.category_running_dd_mean_list = torch.stack(self.category_running_dd_mean_list, 0)
+        self.category_running_patch_var_list = torch.stack(self.category_running_patch_var_list, 0)
+        self.category_running_patch_mean_list = torch.stack(self.category_running_patch_mean_list, 0)
             
     def set_hook(self, pre=True):
         if hasattr(self, "hook"):
@@ -420,60 +451,7 @@ class ConvFeatureHook():
         if self.return_tag:
             return
         if self.category_aware == "local":
-            if self.tea_tag:
-                nch = input[0].shape[1]
-                bs = input[0].shape[0]
-                input_0 = input[0]
-                dd_mean = input_0.mean([0, 2, 3])
-                dd_var = (input_0.permute(1, 0, 2, 3).contiguous().reshape([nch, -1])).var(1, unbiased=False)
-                new_h, new_w = div_four_mul(input_0.shape[2]), div_four_mul(input_0.shape[3])
-                new_input_0 = F.interpolate(input_0, [new_h, new_w], mode="bilinear")
-                new_input_0 = einops.rearrange(new_input_0, "b c (u h) (v w) -> (u v) (b c h w)", h=4, w=4).contiguous()
-                patch_mean = new_input_0.mean([1])
-                patch_var = new_input_0.var([1], unbiased=False)        
-                self.category_running_dd_var_list = dd_var
-                self.category_running_dd_mean_list = dd_mean
-                self.category_running_patch_mean_list = patch_mean
-                self.category_running_patch_var_list = patch_var
-            else:
-                if random.random() > (1. - self.drop_rate):
-                    self.r_feature = torch.Tensor([0.]).to(input[0].device)
-                    return
-                nch = input[0].shape[1]
-                input_0 = input[0]
-                dd_mean = input_0.mean([0, 2, 3])
-                dd_var = (input_0.permute(1, 0, 2, 3).contiguous().reshape([nch, -1])).var(1, unbiased=False)
-                new_h, new_w = div_four_mul(input_0.shape[2]), div_four_mul(input_0.shape[3])
-                new_input_0 = F.interpolate(input_0, [new_h, new_w], mode="bilinear")
-                new_input_0 = einops.rearrange(new_input_0, "b c (u h) (v w) -> (u v) (b c h w)", h=4, w=4).contiguous()
-                patch_mean = new_input_0.mean([1])
-                patch_var = new_input_0.var([1], unbiased=False)        
-                with torch.no_grad():
-                    if isinstance(self.dd_var, int):
-                        self.dd_var = dd_var
-                        self.dd_mean = dd_mean
-                        self.patch_var = patch_var
-                        self.patch_mean = patch_mean
-                    else:
-                        self.dd_var = self.momentum * self.dd_var + (1 - self.momentum) * dd_var
-                        self.dd_mean = self.momentum * self.dd_mean + (1 - self.momentum) * dd_mean
-                        self.patch_var = self.momentum * self.patch_var + (1 - self.momentum) * patch_var
-                        self.patch_mean = self.momentum * self.patch_mean + (1 - self.momentum) * patch_mean
-
-                r_feature = (torch.norm(self.running_dd_var - (self.dd_var + dd_var - dd_var.detach()), 2) + \
-                            torch.norm(self.running_dd_mean - (self.dd_mean + dd_mean - dd_mean.detach()), 2) + \
-                            torch.norm(self.running_patch_mean - (self.patch_mean + patch_mean - patch_mean.detach()), 2) + \
-                            torch.norm(self.running_patch_var - (self.patch_var + patch_var - patch_var.detach()), 2)) * 0.5
-
-                category_dd_var = self.category_running_dd_var_list
-                category_dd_mean = self.category_running_dd_mean_list
-                category_patch_var = self.category_running_patch_var_list
-                category_patch_mean = self.category_running_patch_mean_list
-                r_feature += (torch.norm(category_dd_var - (self.dd_var + dd_var - dd_var.detach()), 2) + \
-                            torch.norm(category_dd_mean - (self.dd_mean + dd_mean - dd_mean.detach()), 2) + \
-                            torch.norm(category_patch_mean - (self.patch_mean + patch_mean - patch_mean.detach()), 2) + \
-                            torch.norm(category_patch_var - (self.patch_var + patch_var - patch_var.detach()), 2)) * 0.5
-                self.r_feature = r_feature
+            raise NotImplementedError("local category-aware is not implemented yet!")
         else:
             if random.random() > (1. - self.drop_rate):
                 self.r_feature = torch.Tensor([0.]).to(input[0].device)
@@ -500,21 +478,35 @@ class ConvFeatureHook():
                     self.patch_var = self.momentum * self.patch_var + (1 - self.momentum) * patch_var
                     self.patch_mean = self.momentum * self.patch_mean + (1 - self.momentum) * patch_mean
 
-            r_feature = (torch.norm(self.running_dd_var - (self.dd_var + dd_var - dd_var.detach()), 2) + \
-                        torch.norm(self.running_dd_mean - (self.dd_mean + dd_mean - dd_mean.detach()), 2) + \
-                        torch.norm(self.running_patch_mean - (self.patch_mean + patch_mean - patch_mean.detach()), 2) + \
-                        torch.norm(self.running_patch_var - (self.patch_var + patch_var - patch_var.detach()), 2)) * 0.5
-
-            category_dd_var = self.category_running_dd_var_list[self.targets.long()].mean(0)
-            category_dd_mean = self.category_running_dd_mean_list[self.targets.long()].mean(0)
-            category_patch_var = self.category_running_patch_var_list[self.targets.long()].mean(0)
-            category_patch_mean = self.category_running_patch_mean_list[self.targets.long()].mean(0)
-
-            r_feature += (torch.norm(category_dd_var - (self.dd_var + dd_var - dd_var.detach()), 2) + \
-                        torch.norm(category_dd_mean - (self.dd_mean + dd_mean - dd_mean.detach()), 2) + \
-                        torch.norm(category_patch_mean - (self.patch_mean + patch_mean - patch_mean.detach()), 2) + \
-                        torch.norm(category_patch_var - (self.patch_var + patch_var - patch_var.detach()), 2)) * 0.5
-
+            syn_dd_mean = self.dd_mean + dd_mean - dd_mean.detach()
+            syn_dd_var = self.dd_var + dd_var - dd_var.detach()
+            syn_patch_mean = self.patch_mean + patch_mean - patch_mean.detach()
+            syn_patch_var = self.patch_var + patch_var - patch_var.detach()
+            
+            loss_global_mean = torch.norm(self.running_dd_mean - syn_dd_mean, 2) + torch.norm(self.running_patch_mean - syn_patch_mean, 2)
+            loss_global_var = torch.norm(self.running_dd_var - syn_dd_var, 2) + torch.norm(self.running_patch_var - syn_patch_var, 2)
+            
+            if self.alpha_per_class is not None:
+                batch_cls = self.targets.long()
+                mean_alpha = self.alpha_per_class[batch_cls].mean()
+                unique_cls = batch_cls.unique()
+                loss_class_mean = sum((1 - self.alpha_per_class[c]) * (torch.norm(self.category_running_dd_mean_list[c] - syn_dd_mean, 2) + torch.norm(self.category_running_patch_mean_list[c] - syn_patch_mean, 2)) for c in unique_cls) / len(unique_cls)
+                loss_class_var = sum((1 - self.alpha_per_class[c]) * (torch.norm(self.category_running_dd_var_list[c] - syn_dd_var, 2) + torch.norm(self.category_running_patch_var_list[c] - syn_patch_var, 2)) for c in unique_cls) / len(unique_cls)
+                r_feature = (loss_global_mean + loss_global_var) * mean_alpha + loss_class_mean + loss_class_var
+            else:
+                category_dd_var = self.category_running_dd_var_list[self.targets.long()].mean(0)
+                category_dd_mean = self.category_running_dd_mean_list[self.targets.long()].mean(0)
+                category_patch_var = self.category_running_patch_var_list[self.targets.long()].mean(0)
+                category_patch_mean = self.category_running_patch_mean_list[self.targets.long()].mean(0)
+                loss_class_mean = torch.norm(category_dd_mean - syn_dd_mean, 2) + torch.norm(category_patch_mean - syn_patch_mean, 2)
+                loss_class_var = torch.norm(category_dd_var - syn_dd_var, 2) + torch.norm(category_patch_var - syn_patch_var, 2)
+                r_feature = (loss_global_mean + loss_global_var + loss_class_mean + loss_class_var) * 0.5
+            
+            self.loss_global_mean = loss_global_mean.detach()
+            self.loss_global_var = loss_global_var.detach()
+            self.loss_class_mean = loss_class_mean.detach() if isinstance(loss_class_mean, torch.Tensor) else torch.tensor(float(loss_class_mean))
+            self.loss_class_var = loss_class_var.detach() if isinstance(loss_class_var, torch.Tensor) else torch.tensor(float(loss_class_var))
+            
             self.r_feature = r_feature
 
     def close(self):

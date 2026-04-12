@@ -5,6 +5,7 @@ import random
 import argparse
 import collections
 import time
+import faulthandler
 
 from tqdm import tqdm
 import numpy as np
@@ -27,6 +28,7 @@ from utils import *
 import models as ti_models
 from baseline import get_network as ti_get_network
 
+faulthandler.enable(all_threads=True)
 
 class ApplyTransformToPair:
     def __init__(self, transform):
@@ -85,9 +87,12 @@ def random_backbone(args,gpu):
 def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier, ipc_id_range):
     args.gpu = gpu
     print("Use GPU: {} for training".format(args.gpu))
-    args.rank = args.rank * ngpus_per_node + gpu
-    dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
-                            world_size=args.world_size, rank=args.rank)
+    if args.distributed:
+        args.rank = args.rank * ngpus_per_node + gpu
+        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+                                world_size=args.world_size, rank=args.rank)
+    else:
+        args.rank = 0
 
     torch.cuda.set_device(args.gpu)
     model_teacher = [_model_teacher.cuda(gpu).eval() for _model_teacher in model_teacher]
@@ -107,6 +112,12 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier, ipc_id
     load_tag_dict = [True for i in range(len(model_teacher))]
     loss_r_feature_layers = [[] for _ in range(len(model_teacher))]
     load_tag = True
+    
+    if args.adaptive_alpha:
+        _data_num = 50000 // 10
+        class_num_list = [int(_data_num * (args.imbanlance_rate ** (i / 9))) for i in range(10)]
+    else:
+        class_num_list = None
 
     for i, (_model_teacher) in enumerate(model_teacher):
         for name, module in _model_teacher.named_modules():
@@ -116,7 +127,8 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier, ipc_id
                                             name=full_name,
                                             gpu=gpu,training_momentum=args.training_momentum,
                                             flatness_weight=args.flatness_weight,
-                                            category_aware=args.category_aware)
+                                            category_aware=args.category_aware,
+                                            class_num_list=class_num_list)
                 _hook_module.set_hook(pre=True)
                 load_tag = load_tag & _hook_module.load_tag
                 load_tag_dict[i] = load_tag_dict[i] & _hook_module.load_tag
@@ -128,7 +140,8 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier, ipc_id
                                                gpu=gpu, training_momentum=args.training_momentum,
                                                drop_rate=args.drop_rate,
                                                flatness_weight=args.flatness_weight,
-                                               category_aware=args.category_aware)
+                                               category_aware=args.category_aware,
+                                               class_num_list=class_num_list)
                 _hook_module.set_hook(pre=True)
                 load_tag = load_tag & _hook_module.load_tag
                 load_tag_dict[i] = load_tag_dict[i] & _hook_module.load_tag
@@ -193,6 +206,9 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier, ipc_id
                         _loss_t_feature_layer.save()
 
         print("Training Statistic Information Is Successfully Saved")
+        for j in range(len(loss_r_feature_layers)):
+            for _loss_t_feature_layer in loss_r_feature_layers[j]:
+                _loss_t_feature_layer.set_hook(pre=False)
     else:
         print("Training Statistic Information Is Successfully Load")
 
@@ -286,6 +302,17 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier, ipc_id
             loss_aux = args.r_loss * loss_r_feature + loss_ema_ce * args.flatness_weight
 
             loss = loss_ce + loss_aux
+            
+            if args.gpu == 0:
+                total_global_mean = sum(mod.loss_global_mean.item() for mod in loss_r_feature_layers[id])
+                total_global_var  = sum(mod.loss_global_var.item()  for mod in loss_r_feature_layers[id])
+                total_class_mean  = sum(mod.loss_class_mean.item()  for mod in loss_r_feature_layers[id])
+                total_class_var   = sum(mod.loss_class_var.item()   for mod in loss_r_feature_layers[id])
+                print(f"Iter [{iteration+1}/{iterations_per_layer}]  "
+                      f"loss={loss.item():.4f}  loss_ce={loss_ce.item():.4f}  "
+                      f"loss_r_feature={loss_r_feature.item():.4f}  loss_ema_ce={loss_ema_ce.item():.4f}  "
+                      f"[r_feat breakdown]  global_mean={total_global_mean:.4f}  global_var={total_global_var:.4f}  "
+                      f"class_mean={total_class_mean:.4f}  class_var={total_class_var:.4f}")
 
             if iteration % save_every == 0 and args.gpu == 0:
                 print("------------iteration {}----------".format(iteration))
@@ -325,6 +352,9 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier, ipc_id
         # to reduce memory consumption by states of the optimizer we deallocate memory
         optimizer.state = collections.defaultdict(dict)
         torch.cuda.empty_cache()
+        
+    if args.distributed and dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def save_images(args, images, targets, ipc_ids):
@@ -391,6 +421,8 @@ def main_syn():
                         help='where to load the pre-trained backbone')
     parser.add_argument('--imbanlance_rate', default=0.1, type=float,
                         help='imbalance')
+    parser.add_argument('--adaptive-alpha', action='store_true',
+                        help='use class-adaptive alpha weighting: alpha_c=(n_c-n_min)/(n_max-n_min)')
     parser.add_argument('--store-best-images', action='store_true',
                         help='whether to store best images')
     """Optimization related flags"""
@@ -493,11 +525,18 @@ def main_syn():
     model_verifier = model_teacher[0]
     ipc_id_range = list(range(0, args.ipc_number))
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+    ngpus_per_node = torch.cuda.device_count()
+    if ngpus_per_node < 1:
+        raise RuntimeError("No CUDA device is visible. Check CUDA_VISIBLE_DEVICES and the NVIDIA driver state.")
+    args.world_size = ngpus_per_node * args.world_size
+    if ngpus_per_node == 1:
+        print("Single visible GPU detected, skipping distributed spawn.")
+        args.distributed = False
+        main_worker(0, ngpus_per_node, args, model_teacher, model_verifier, ipc_id_range)
+        return
     port_id = 10000 + np.random.randint(0, 1000)
     args.dist_url = 'tcp://127.0.0.1:' + str(port_id)
     args.distributed = True
-    ngpus_per_node = torch.cuda.device_count()
-    args.world_size = ngpus_per_node * args.world_size
     torch.multiprocessing.set_start_method('spawn')
     mp.spawn(main_worker, nprocs=ngpus_per_node,
              args=(ngpus_per_node, args, model_teacher, model_verifier, ipc_id_range))
