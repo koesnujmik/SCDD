@@ -28,6 +28,12 @@ parser.add_argument(
     help="number of classes for synthesis",
 )
 parser.add_argument(
+    "--imbanlance-rate",
+    type=float,
+    default=0.1,
+    help="imbalance rate for training dataset",
+)
+parser.add_argument(
     "--mipc",
     type=int,
     default=600,

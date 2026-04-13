@@ -47,8 +47,6 @@ def convnet3(nclass, logger=None):
 
 
 def init_images(args, model=None):
-    args.imbanlance_rate = 0.01
-    args.num_crop = 1
     transform = transforms.Compose(
         [
             transforms.ToTensor(),
@@ -64,7 +62,7 @@ def init_images(args, model=None):
     elif args.subset == 'cifar10':
         trainset = cifar10Imbanlance.Cifar10Imbanlance(transform=transform,imbanlance_rate=args.imbanlance_rate, train=True,file_path='../expert/root')
     elif args.subset == 'cifar100':
-        trainset = cifar100Imbanlance.Cifar100Imbanlance(transform=transform,imbanlance_rate=args.imbanlance_rate, train=True,file_path=os.path.join(''))
+        trainset = cifar100Imbanlance.Cifar100Imbanlance(transform=transform,imbanlance_rate=args.imbanlance_rate, train=True,file_path='../expert/root/cifar-100-python/')
     else:
         pass
 
@@ -88,6 +86,7 @@ def init_images(args, model=None):
             cls_id=num,
             method=args.selection_method,
             imbanlance_rate=args.imbanlance_rate,
+            n_class=args.nclass,
         )
         num = num + 1
         images = mix_images(images, args.input_size, args.factor, args.ipc)
@@ -118,7 +117,7 @@ def main(args):
             model = convnet4(nclass=200)
         elif args.subset == 'cifar10':
             model = convnet3(nclass=10)
-        else:
+        elif args.subset == 'cifar100':
             model = convnet3(nclass=100)
         checkpoint = torch.load(args.pre_train_path, map_location='cuda')
         # checkpoint = torch.load("",map_location="cpu")

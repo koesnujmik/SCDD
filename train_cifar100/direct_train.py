@@ -13,7 +13,7 @@ from copy import deepcopy
 import ResNet_cifar
 import torch.distributed as dist
 sys.path.append('../')
-import relabel.models as ti_models
+# import relabel.models as ti_models
 from baseline import get_network as ti_get_network
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -34,7 +34,63 @@ class DataLoaderX(DataLoader):
     def __iter__(self):
         return BackgroundGenerator(super().__iter__())
 
-from relabel.utils_fkd import mix_aug
+def rand_bbox(size, lam):
+    W = size[2]
+    H = size[3]
+    cut_rat = np.sqrt(1. - lam)
+    cut_w = int(W * cut_rat)
+    cut_h = int(H * cut_rat)
+
+    # uniform
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+
+    bbx1 = np.clip(cx - cut_w // 2, 0, W)
+    bby1 = np.clip(cy - cut_h // 2, 0, H)
+    bbx2 = np.clip(cx + cut_w // 2, 0, W)
+    bby2 = np.clip(cy + cut_h // 2, 0, H)
+
+    return bbx1, bby1, bbx2, bby2
+
+def cutmix(images, args, rand_index=None, lam=None, bbox=None):
+    if args.mode == 'fkd_save':
+        rand_index = torch.randperm(images.size()[0]).cuda()
+        lam = np.random.beta(args.cutmix, args.cutmix)
+        bbx1, bby1, bbx2, bby2 = rand_bbox(images.size(), lam)
+    elif args.mode == 'fkd_load':
+        assert rand_index is not None and lam is not None and bbox is not None
+        rand_index = rand_index.cuda()
+        lam = lam
+        bbx1, bby1, bbx2, bby2 = bbox
+    else:
+        raise ValueError('mode should be fkd_save or fkd_load')
+
+    images[:, :, bbx1:bbx2, bby1:bby2] = images[rand_index, :, bbx1:bbx2, bby1:bby2]
+    return images, rand_index.cpu(), lam, [bbx1, bby1, bbx2, bby2]
+
+
+def mixup(images, args, rand_index=None, lam=None):
+    if args.mode == 'fkd_save':
+        rand_index = torch.randperm(images.size()[0]).cuda()
+        lam = np.random.beta(args.mixup, args.mixup)
+    elif args.mode == 'fkd_load':
+        assert rand_index is not None and lam is not None
+        rand_index = rand_index.cuda()
+        lam = lam
+    else:
+        raise ValueError('mode should be fkd_save or fkd_load')
+
+    mixed_images = lam * images + (1 - lam) * images[rand_index]
+    return mixed_images, rand_index.cpu(), lam, None
+
+
+def mix_aug(images, args, rand_index=None, lam=None, bbox=None):
+    if args.mix_type == 'mixup':
+        return mixup(images, args, rand_index, lam)
+    elif args.mix_type == 'cutmix':
+        return cutmix(images, args, rand_index, lam, bbox)
+    else:
+        return images, None, None, None
 
 # It is imported for you to access and modify the PyTorch source code (via Ctrl+Click), more details in README.md
 from torch.utils.data._utils.fetch import _MapDatasetFetcher
@@ -132,7 +188,7 @@ class ALRS():
         return [self.p_lr]
 
 def get_args():
-    parser = argparse.ArgumentParser("FKD Training on ImageNet-1K")
+    parser = argparse.ArgumentParser("FKD Training on Cifar100")
     parser.add_argument('--batch-size', type=int,
                         default=100, help='batch size')
     parser.add_argument('--gradient-accumulation-steps', type=int,
@@ -153,8 +209,7 @@ def get_args():
                         help='the type of the loss function')
     parser.add_argument('--train-dir', type=str, default=None,
                         help='path to training dataset')
-    parser.add_argument('--val-dir', type=str,
-                        default='/path/to/imagenet/val', help='path to validation dataset')
+    parser.add_argument('--val-dir', type=str, default='../expert/root/', help='path to validation dataset')
     parser.add_argument('--output-dir', type=str,
                         default='./save/1024', help='path to output dir')
     parser.add_argument('--ls-type', default="cos",
@@ -214,11 +269,19 @@ def main():
     args = get_args()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+    ngpus_per_node = torch.cuda.device_count()
+    if ngpus_per_node < 1:
+        raise RuntimeError("No CUDA device is visible. Check CUDA_VISIBLE_DEVICES and the NVIDIA driver state.")
+    args.world_size = ngpus_per_node * args.world_size
+    if ngpus_per_node == 1:
+        print("Single visible GPU detected, skipping distributed spawn.")
+        args.distributed = False
+        main_worker(0, ngpus_per_node, args)
+        return
+    
     port_id = 10002 + np.random.randint(0, 1000)
     args.dist_url = 'tcp://127.0.0.1:' + str(port_id)
     args.distributed = True
-    ngpus_per_node = torch.cuda.device_count()
-    args.world_size = ngpus_per_node * args.world_size
     torch.multiprocessing.set_start_method('spawn')
     mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
 
@@ -226,9 +289,12 @@ def main():
 def main_worker(gpu, ngpus_per_node, args):
     wandb.login(key=args.wandb_api_key)
     wandb.init(project=args.wandb_project, name=args.output_dir.split('/')[-1])
-    args.rank = gpu
-    dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
-                            world_size=args.world_size, rank=args.rank)
+    if args.distributed:
+        args.rank = gpu
+        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+                                world_size=args.world_size, rank=args.rank)
+    else:
+        args.rank = 0
     if not torch.cuda.is_available():
         raise Exception("need gpu to train!")
 
@@ -251,12 +317,20 @@ def main_worker(gpu, ngpus_per_node, args):
         ]))
 
     grad_scaler = torch.cuda.amp.GradScaler()
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    train_sampler = None
+    if args.distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
     train_loader = DataLoaderX(
-        train_dataset, batch_size=args.batch_size, shuffle=False, sampler=train_sampler, num_workers=args.workers, pin_memory=True)
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
+        num_workers=args.workers,
+        pin_memory=True,
+    )
 
     # load validation data
-    val_dataset = torchvision.datasets.CIFAR100(root=args.val_dir, train=False, download=True,
+    val_dataset = torchvision.datasets.CIFAR100(root=args.val_dir, train=False, download=False,
                                                transform=transforms.Compose([
                                                    transforms.ToTensor(),
                                                    normalize,
@@ -293,7 +367,7 @@ def main_worker(gpu, ngpus_per_node, args):
         if name == "resnet32":
             checkpoint = torch.load(os.path.join(args.pre_train_path, f""),map_location="cpu")
         elif name == "convnet":
-            checkpoint = torch.load(os.path.join(args.pre_train_path, f""),map_location="cpu")
+            checkpoint = torch.load(args.pre_train_path,map_location="cpu")
         model_teacher[-1].load_state_dict(checkpoint['state_dict'])
 
     for _model in model_teacher:
@@ -366,6 +440,8 @@ def main_worker(gpu, ngpus_per_node, args):
         }, is_best, output_dir=args.output_dir)
 
     wandb.finish()
+    if args.distributed and dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def adjust_bn_momentum(model, iters):
@@ -387,7 +463,8 @@ def train(model, model_teacher, args, epoch=None, gpu=0, ngpus_per_node=1, scale
     for _model in model_teacher:
         _model.eval()
     t1 = time.time()
-    args.train_loader.sampler.set_epoch(epoch)
+    if args.distributed and hasattr(args.train_loader, "sampler") and args.train_loader.sampler is not None:
+        args.train_loader.sampler.set_epoch(epoch)
     for batch_idx, (images, target) in enumerate(args.train_loader):
         images = images.cuda()
         target = target.cuda()

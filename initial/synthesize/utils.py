@@ -211,7 +211,7 @@ def _score_shrinkage_kmeans(model, flat_images, m, keep_limit, n, mipc, imbanlan
     return scores, selected_img_ids
 
 
-def selector(n, model, images, labels, size, m=3, cls_id=0, method='original', imbanlance_rate=0.01):
+def selector(n, model, images, labels, size, m=3, cls_id=0, method='original', imbanlance_rate=0.01, n_class=100):
     """
     Multi-round selection over keep_limit real images.
     Each (real image, augmentation) pair is selected at most once.
@@ -228,7 +228,7 @@ def selector(n, model, images, labels, size, m=3, cls_id=0, method='original', i
         device = images.device
         s = images.shape  # [mipc, m, 3, H, W]
 
-        keep_limit = int(5000 * (0.01 ** (cls_id / 9)))
+        keep_limit = int(mipc * (imbanlance_rate ** (cls_id / n_class-1)))
         keep_limit = min(mipc, keep_limit)
         if keep_limit == 0:
             return torch.empty((0, 3, s[3], s[4]), device=device)

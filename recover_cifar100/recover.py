@@ -26,7 +26,7 @@ import multiprocessing
 import torch.distributed as dist
 
 from utils import *
-import models as ti_models
+# import models as ti_models
 from baseline import get_network as ti_get_network
 
 def convnet3(nclass, logger=None):
@@ -58,10 +58,13 @@ class ApplyTransformToPair:
 def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier, ipc_id_range):
     args.gpu = gpu
     print("Use GPU: {} for training".format(args.gpu))
-    args.rank = args.rank * ngpus_per_node + gpu
-    dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
-                            world_size=args.world_size, rank=args.rank)
-
+    if args.distributed:
+        args.rank = args.rank * ngpus_per_node + gpu
+        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+                                world_size=args.world_size, rank=args.rank)
+    else:
+        args.rank = 0
+    
     torch.cuda.set_device(args.gpu)
     model_teacher = [_model_teacher.cuda(gpu).eval() for _model_teacher in model_teacher]
 
@@ -390,7 +393,7 @@ def main_syn():
                         help='whether to evaluate synthetic data with another model')
     parser.add_argument('--verifier-arch', type=str, default='mobilenet_v2',
                         help="arch name from torchvision models to act as a verifier")
-    parser.add_argument('--train-data-path', type=str, default='./cifar100/train',
+    parser.add_argument('--train-data-path', type=str, default='../expert/root/cifar-100-python/',
                         help="the path of the CIFAR-100's training set")
     parser.add_argument('--statistic-path', type=str, default='./statistic',
                         help="the path of the statistic file")
@@ -400,7 +403,7 @@ def main_syn():
     if not os.path.exists(args.syn_data_path):
         os.makedirs(args.syn_data_path)
 
-    aux_teacher = ["resnet32"]
+    aux_teacher = ["convnet"]
     args.aux_teacher = aux_teacher
     model_teacher = []
     for name in aux_teacher:
@@ -417,7 +420,7 @@ def main_syn():
             checkpoint = torch.load(os.path.join(args.pre_train_path, f".ptn"),map_location="cpu")
             model_teacher[-1].load_state_dict(checkpoint['state_dict'])
         elif name == "convnet":
-            checkpoint = torch.load(os.path.join(args.pre_train_path, f"{name}.pth"),map_location="cpu")
+            checkpoint = torch.load(args.pre_train_path, map_location="cpu")
             state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
             # 2. Strip module prefixes
             new_state_dict = {}
@@ -429,11 +432,18 @@ def main_syn():
     model_verifier = model_teacher[0]
     ipc_id_range = list(range(0, args.ipc_number))
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+    ngpus_per_node = torch.cuda.device_count()
+    if ngpus_per_node < 1:
+        raise RuntimeError("No CUDA device is visible. Check CUDA_VISIBLE_DEVICES and the NVIDIA driver state.")
+    args.world_size = ngpus_per_node * args.world_size
+    if ngpus_per_node == 1:
+        print("Single visible GPU detected, skipping distributed spawn.")
+        args.distributed = False
+        main_worker(0, ngpus_per_node, args, model_teacher, model_verifier, ipc_id_range)
+        return
     port_id = 10000 + np.random.randint(0, 1000)
     args.dist_url = 'tcp://127.0.0.1:' + str(port_id)
     args.distributed = True
-    ngpus_per_node = torch.cuda.device_count()
-    args.world_size = ngpus_per_node * args.world_size
     torch.multiprocessing.set_start_method('spawn')
     mp.spawn(main_worker, nprocs=ngpus_per_node,
              args=(ngpus_per_node, args, model_teacher, model_verifier, ipc_id_range))
