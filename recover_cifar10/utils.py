@@ -150,7 +150,7 @@ class BNFeatureHook():
         if class_num_list is not None:
             n = torch.tensor(class_num_list, dtype=torch.float)
             n_min, n_max = n.min(), n.max()
-            alpha = (n - n_min) / (n_max - n_min)
+            alpha = 1 - ((n - n_min) / (n_max - n_min))
             self.alpha_per_class = alpha.cuda(gpu)
         else:
             self.alpha_per_class = None
@@ -325,7 +325,7 @@ class ConvFeatureHook():
         if class_num_list is not None:
             n = torch.tensor(class_num_list, dtype=torch.float)
             n_min, n_max = n.min(), n.max()
-            alpha = 1 - ((n - n_min) / (n_max - n_min))  # tail→1, head→0 (reverse)
+            alpha = 1 - ((n - n_min) / (n_max - n_min))  # head→0 tail→1
             self.alpha_per_class = alpha.cuda(gpu)
         else:
             self.alpha_per_class = None
