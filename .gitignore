@@ -24,6 +24,7 @@ expert/root/*.tar
 expert/root/*.zip
 initial/exp/
 recover_*/syn_data_50/
+recover_*/syn_data/
 recover_*/statistic/
 recover_*/biased_statistic/
 
@@ -32,6 +33,10 @@ train_*/wandb/
 wandb/
 *.log
 log.txt
+
+# New layered experiment layout
+experiments/
+*.lock
 
 # IDE
 .vscode/

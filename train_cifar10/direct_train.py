@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import math
 import time
 import shutil
@@ -15,6 +16,7 @@ import torch.distributed as dist
 sys.path.append('../')
 # import relabel.models as ti_models
 from baseline import get_network as ti_get_network
+import torch
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torchvision
@@ -37,6 +39,36 @@ normalize = transforms.Normalize([0.5071, 0.4867, 0.4408],
 class DataLoaderX(DataLoader):
     def __iter__(self):
         return BackgroundGenerator(super().__iter__())
+
+
+class BalancedBatchSampler(torch.utils.data.Sampler):
+    """매 배치에 모든 클래스를 n_per_class개씩 확정적으로 포함.
+    batch_size는 num_classes의 배수여야 함.
+    """
+    def __init__(self, dataset, batch_size):
+        self.n_classes = len(dataset.classes)
+        assert batch_size % self.n_classes == 0, (
+            f"batch_size({batch_size})는 num_classes({self.n_classes})의 배수여야 합니다")
+        self.n_per_class = batch_size // self.n_classes
+
+        targets = [s[1] for s in dataset.samples]
+        self.class_indices = [[] for _ in range(self.n_classes)]
+        for idx, t in enumerate(targets):
+            self.class_indices[t].append(idx)
+
+        self.n_batches = min(len(idxs) for idxs in self.class_indices) // self.n_per_class
+
+    def __iter__(self):
+        shuffled = [torch.randperm(len(idxs)).tolist() for idxs in self.class_indices]
+        for b in range(self.n_batches):
+            batch = []
+            for c in range(self.n_classes):
+                start = b * self.n_per_class
+                batch += [self.class_indices[c][shuffled[c][i]] for i in range(start, start + self.n_per_class)]
+            yield batch
+
+    def __len__(self):
+        return self.n_batches
 
 def rand_bbox(size, lam):
     W = size[2]
@@ -191,6 +223,30 @@ class ALRS():
     def get_last_lr(self):
         return [self.p_lr]
 
+def SupConLoss(features, labels, temperature=0.1):
+    """Supervised Contrastive Loss (Khosla et al. 2020).
+    features: [N, dim] unnormalized embeddings
+    labels:   [N] integer class labels
+    """
+    features = F.normalize(features, dim=1)
+    N = features.shape[0]
+    device = features.device
+    sim = torch.matmul(features, features.T) / temperature
+    sim_max, _ = sim.max(dim=1, keepdim=True)
+    sim = sim - sim_max.detach()
+    mask_self = torch.eye(N, dtype=torch.bool, device=device)
+    labels_col = labels.view(-1, 1)
+    mask_pos = (labels_col == labels_col.T).float().masked_fill(mask_self, 0)
+    exp_sim = torch.exp(sim) * (~mask_self).float()
+    log_prob = sim - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-8)
+    num_pos = mask_pos.sum(dim=1)
+    valid = num_pos > 0
+    if not valid.any():
+        return torch.tensor(0., device=device, requires_grad=True)
+    mean_log_prob_pos = (mask_pos * log_prob).sum(dim=1) / (num_pos + 1e-8)
+    return -mean_log_prob_pos[valid].mean()
+
+
 def get_args():
     parser = argparse.ArgumentParser("FKD Training on ImageNet-1K")
     parser.add_argument('--batch-size', type=int,
@@ -257,12 +313,22 @@ def get_args():
                         default='Temperature', help='wandb project name')
     parser.add_argument('--wandb-api-key', type=str,
                         default=None, help='wandb api key')
+    parser.add_argument('--wandb-run-id', type=str, default=None,
+                        help='resume an existing wandb run by ID (from recover stage)')
+    parser.add_argument('--wandb-run-name', type=str, default=None,
+                        help='wandb run display name; ignored if --wandb-run-id is set')
     parser.add_argument('--mix-type', default=None, type=str,
                         choices=['mixup', 'cutmix', None], help='mixup or cutmix or None')
     parser.add_argument('--fkd_seed', default=42, type=int,
                         help='seed for batch loading sampler')
     parser.add_argument('--world-size', default=1, type=int,
                         help='number of nodes for distributed training')
+    parser.add_argument('--supcon-weight', type=float, default=0.0,
+                        help='SupCon loss weight on student projection embeddings (0 = off)')
+    parser.add_argument('--supcon-temperature', type=float, default=0.1,
+                        help='temperature for SupCon loss in training stage')
+    parser.add_argument('--balanced-sampling', action='store_true', default=False,
+                        help='use WeightedRandomSampler for class-balanced batches')
 
     args = parser.parse_args()
 
@@ -292,8 +358,17 @@ def main():
 
 
 def main_worker(gpu, ngpus_per_node, args):
+    os.makedirs(args.output_dir, exist_ok=True)
+    if gpu == 0:
+        with open(os.path.join(args.output_dir, "args.json"), "w") as _f:
+            json.dump({k: (v if isinstance(v, (int, float, str, bool, list, dict, type(None))) else str(v))
+                       for k, v in vars(args).items()}, _f, indent=2)
     wandb.login(key=args.wandb_api_key)
-    wandb.init(project=args.wandb_project, name=args.output_dir.split('/')[-1])
+    if args.wandb_run_id:
+        wandb.init(project=args.wandb_project, id=args.wandb_run_id, resume="must")
+    else:
+        run_name = args.wandb_run_name or args.output_dir.split('/')[-1]
+        wandb.init(project=args.wandb_project, name=run_name)
     if args.distributed:
         args.rank = gpu
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
@@ -323,8 +398,14 @@ def main_worker(gpu, ngpus_per_node, args):
         ]))
 
     grad_scaler = torch.cuda.amp.GradScaler()
-    train_loader = DataLoaderX(
-        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=False)
+    if args.balanced_sampling:
+        batch_sampler = BalancedBatchSampler(train_dataset, batch_size=args.batch_size)
+        train_loader = DataLoaderX(
+            train_dataset, batch_sampler=batch_sampler, num_workers=args.workers, pin_memory=False)
+    else:
+        train_loader = DataLoaderX(
+            train_dataset, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.workers, pin_memory=False)
 
     # load validation data
     val_dataset = torchvision.datasets.CIFAR10(root=args.val_dir, train=False, download=True,
@@ -473,6 +554,19 @@ def main_worker(gpu, ngpus_per_node, args):
             'optimizer': optimizer.state_dict(),
         }, is_best, output_dir=args.output_dir)
 
+    if gpu == 0:
+        _best = args.best_acc1
+        if hasattr(_best, "item"):
+            _best = _best.item()
+        with open(os.path.join(args.output_dir, "summary.json"), "w") as _f:
+            json.dump({
+                "best_acc1": float(_best),
+                "model_best_path": os.path.join(args.output_dir, "model_best.pth.tar"),
+                "checkpoint_path": os.path.join(args.output_dir, "checkpoint.pth.tar"),
+                "wandb_run_id": wandb.run.id if wandb.run else None,
+                "wandb_run_name": wandb.run.name if wandb.run else None,
+            }, _f, indent=2)
+
     wandb.finish()
     if args.distributed and dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
@@ -500,8 +594,16 @@ def train(model, model_teacher, args, epoch=None, gpu=0, ngpus_per_node=1, scale
     for batch_idx, (images, target) in enumerate(args.train_loader):
         images = images.cuda()
         target = target.cuda()
-        images, _, _, _ = mix_aug(images, args)
         optimizer.zero_grad()
+
+        # SupCon: mix_aug 전 원본 이미지로 embedding 추출 → clean label 사용 가능
+        if args.supcon_weight > 0:
+            with torch.cuda.amp.autocast(enabled=False):
+                _stu_z = model(images, train=True)[2]
+        else:
+            _stu_z = None
+
+        images, _, _, _ = mix_aug(images.clone(), args)
         soft_label = []
 
         with torch.no_grad() and torch.cuda.amp.autocast(enabled=True):
@@ -532,6 +634,9 @@ def train(model, model_teacher, args, epoch=None, gpu=0, ngpus_per_node=1, scale
                 loss_function_kl(F.log_softmax(output, dim=1),F.softmax(ema_output, dim=1)) * 0.4
         else:
             raise NotImplementedError
+        if args.supcon_weight > 0 and _stu_z is not None:
+            loss_supcon = SupConLoss(_stu_z, target, temperature=args.supcon_temperature)
+            loss = loss + args.supcon_weight * loss_supcon
         loss.backward()
         # scaler.scale(loss).backward()
         n = images.size(0)

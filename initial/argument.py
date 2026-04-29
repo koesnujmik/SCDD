@@ -280,10 +280,16 @@ if args.re_accum_steps != 1:
     args.re_batch_size = int(args.re_batch_size / args.re_accum_steps)
 
 # result dir for saving
-args.exp_name = f"{args.exp_name}{args.subset}_{args.arch_name}_{args.selection_method}_f{args.factor}_mipc{args.mipc}_ipc{args.ipc}_cr{args.num_crop}"
-if not os.path.exists(f"./exp/{args.exp_name}"):
-    os.makedirs(f"./exp/{args.exp_name}")
-args.syn_data_path = os.path.join("./exp/" + args.exp_name, args.syn_data_path)
+# If --syn-data-path is an absolute path, treat it as the explicit output dir
+# (used by the experiments/{exp_name}/initials/{init_id}/syn_data layout) and
+# skip the legacy ./exp/{exp_name}/ composition entirely.
+if not os.path.isabs(args.syn_data_path):
+    args.exp_name = f"{args.exp_name}{args.subset}_{args.arch_name}_{args.selection_method}_f{args.factor}_mipc{args.mipc}_ipc{args.ipc}_cr{args.num_crop}"
+    if not os.path.exists(f"./exp/{args.exp_name}"):
+        os.makedirs(f"./exp/{args.exp_name}")
+    args.syn_data_path = os.path.join("./exp/" + args.exp_name, args.syn_data_path)
+else:
+    os.makedirs(args.syn_data_path, exist_ok=True)
 
 # temperature
 if args.mix_type == "mixup":

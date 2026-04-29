@@ -17,6 +17,7 @@ from imbalance_data import imageImbanlance, cifar10Imbanlance,cifar100Imbanlance
 import logging
 from convnet import ConvNet
 import datetime
+import json
 import math
 from sklearn.metrics import confusion_matrix
 from Trainer import Trainer
@@ -93,9 +94,14 @@ def main():
     args = parser.parse_args()
     print(args)
     curr_time = datetime.datetime.now()
-    args.store_name = '#'.join(["dataset: " + args.dataset, "arch: " + args.arch,"imbanlance_rate: " + str(args.imbanlance_rate)
-            ,datetime.datetime.strftime(curr_time, '%Y-%m-%d %H:%M:%S')])
+    # args.store_name = '#'.join(["dataset: " + args.dataset, "arch: " + args.arch,"imbanlance_rate: " + str(args.imbanlance_rate)
+    #         ,datetime.datetime.strftime(curr_time, '%Y-%m-%d %H:%M:%S')])
+    if not args.exp_out_subdir:
+        args.store_name = f"{args.store_name}_{args.dataset}_{args.arch}_IF{str(args.imbanlance_rate)}"
     prepare_folders(args)
+    with open(os.path.join(args.root_model, args.store_name, "args.json"), "w") as _f:
+        json.dump({k: (v if isinstance(v, (int, float, str, bool, list, dict, type(None))) else str(v))
+                   for k, v in vars(args).items()}, _f, indent=2)
     if args.seed is not None:
         random.seed(args.seed)
         np.random.seed(args.seed)
@@ -142,7 +148,7 @@ def main_worker(gpu, args):
             print("=> no checkpoint found at '{}'".format(args.resume))
     log_format = '%(asctime)s %(message)s'
     logging.basicConfig(stream=sys.stdout, level=logging.INFO, format=log_format, datefmt='%m/%d %I:%M:%S %p')
-    fh = logging.FileHandler(os.path.join(args.root_log + args.store_name, 'log.txt'))
+    fh = logging.FileHandler(os.path.join(args.root_log, args.store_name, 'log.txt'))
     fh.setFormatter(logging.Formatter(log_format))
     logger = logging.getLogger()
     logger.addHandler(fh)
@@ -198,18 +204,20 @@ if __name__ == '__main__':
     parser.add_argument('--resample_weighting', default=0.2, type=float,help='weighted for sampling probability (q(1,k))')
     parser.add_argument('--q', default=0.8, type=float, help='sharpness of weighting')
     parser.add_argument('--gamma1', default=1, type=float, help='weight for L_robust (SimSiam)')
-    parser.add_argument('--gamma2', default=0.5, type=float, help='weight for L_supcon (SupCon)')
+    parser.add_argument('--gamma2', default=0, type=float, help='weight for L_supcon (SupCon)')
     parser.add_argument('--temperature', default=0.1, type=float, help='SupCon temperature τ')
     parser.add_argument('--dir_train_txt',default='', type=str)
     parser.add_argument('--dir_test_txt',default='', type=str)
     # etc.
     parser.add_argument('--seed', default=3407, type=int, help='seed for initializing training. ')
     parser.add_argument('-p', '--print_freq', default=1000, type=int, metavar='N',help='print frequency (default: 100)')
-    parser.add_argument('--gpu', default=None, type=int,help='GPU id to use.')
+    parser.add_argument('--gpu', default=0, type=int,help='GPU id to use.')
     parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',help='number of data loading workers (default: 4)')
     parser.add_argument('--resume', default=None, type=str, metavar='PATH',help='path to latest checkpoint (default: none)')
     parser.add_argument('--start-epoch', default=0, type=int, metavar='N',help='manual epoch number (useful on restarts)')
     parser.add_argument('--root_log', type=str, default='root/log/')
     parser.add_argument('--root_model', type=str, default='root/model/')
     parser.add_argument('--store_name', type=str, default='')
+    parser.add_argument('--exp-out-subdir', action='store_true',
+                        help='use --store_name verbatim as the output subdir (skip the _{dataset}_{arch}_IF{rate} suffix)')
     main()

@@ -118,19 +118,22 @@ class Trainer(object):
 
                 balance_loss = loss_mix + loss_cut
                 rebalance_loss = loss_mix_w + loss_cut_w
-
-                # SupCon: 원본 view + balanced sampler 샘플 concat → 1회 forward
-                n = input_org_1.size(0)
-                supcon_input = torch.cat([input_org_1, input_org_2, input_invs_1, input_invs_2], dim=0)
-                _, _, z_supcon, _ = self.model(supcon_input, train=True)
-                supcon_labels = torch.cat([
-                    target_org, target_org,
-                    target_invs[:n], target_invs[:n],
-                ], dim=0).cuda()
-                supcon_loss = self.SupConLoss(z_supcon, supcon_labels)  # L_supcon
-
+                
                 loss = (alpha * balance_loss + (1 - alpha) * rebalance_loss
-                        + self.gamma1 * robust_loss + self.gamma2 * supcon_loss)
+                        + self.gamma1 * robust_loss)
+                
+                if self.gamma2 > 0:
+                    # SupCon: 원본 view + balanced sampler 샘플 concat → 1회 forward
+                    n = input_org_1.size(0)
+                    supcon_input = torch.cat([input_org_1, input_org_2, input_invs_1, input_invs_2], dim=0)
+                    _, _, z_supcon, _ = self.model(supcon_input, train=True)
+                    supcon_labels = torch.cat([
+                        target_org, target_org,
+                        target_invs[:n], target_invs[:n],
+                    ], dim=0).cuda()
+                    supcon_loss = self.SupConLoss(z_supcon, supcon_labels)  # L_supcon
+
+                    loss = loss + self.gamma2 * supcon_loss
 
                 losses.update(loss.item(), inputs[0].size(0))
 

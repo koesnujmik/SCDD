@@ -295,7 +295,7 @@ def selector(n, model, images, labels, size, m=3, cls_id=0, method='original', i
 
                 if len(selected) == n:
                     break
-            
+
             if len(selected) < n:
                 used_mask = torch.zeros_like(scores, dtype=torch.bool)
                 selected_pairs = set()

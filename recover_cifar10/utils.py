@@ -99,7 +99,12 @@ def denormalize(image_tensor, use_fp16=False):
 
     return image_tensor
 
-
+def projection_loss(residual, direction):
+    numer = torch.sum(residual * direction)
+    denom = torch.sum(direction * direction)
+    safe = torch.isfinite(numer) & torch.isfinite(denom) & (denom > 1e-6)
+    zeros = numer.new_zeros(())
+    return torch.where(safe, numer.square() / denom.clamp_min(1e-6), zeros)
 
 class EMA(object):
     def __init__(self, alpha, initial_value=None):
@@ -116,7 +121,7 @@ class EMA(object):
 
 class BNFeatureHook():
     def __init__(self, module, save_path="./", training_momentum=0.4, name=None, gpu=0, flatness_weight=0,
-                      category_aware = 'global', class_num_list=None):
+                      category_aware = 'global', class_num_list=None, num_classes=10, enable_struct=False):
         self.module = module
         if module is not None and name is not None:
             self.hook = module.register_forward_hook(self.post_hook_fn)
@@ -134,7 +139,7 @@ class BNFeatureHook():
         self.loss_global_var = torch.tensor(0.)
         self.loss_class_mean = torch.tensor(0.)
         self.loss_class_var = torch.tensor(0.)
-        
+
         for i in range(10):
             cls_dir = os.path.join(save_path, f"BNFeatureHook", f"class_{i}", name)
             if not os.path.exists(cls_dir):
@@ -146,7 +151,10 @@ class BNFeatureHook():
         self.category_running_dd_mean_list = [0. for i in range(10)]
         self.load_tag = True
         self.category_aware = category_aware
-        
+        self.num_classes = num_classes
+        self.enable_struct = enable_struct
+        self.loss_struct = torch.tensor(0.)
+
         if class_num_list is not None:
             n = torch.tensor(class_num_list, dtype=torch.float)
             n_min, n_max = n.min(), n.max()
@@ -168,7 +176,11 @@ class BNFeatureHook():
             if self.load_tag:
                 self.category_running_dd_var_list = torch.stack(self.category_running_dd_var_list,0)
                 self.category_running_dd_mean_list = torch.stack(self.category_running_dd_mean_list,0)
-            
+                if self.enable_struct:
+                    M = self.category_running_dd_mean_list  # [C, d_l]
+                    G = torch.cdist(M, M, p=2).pow(2)       # [C, C]
+                    self.real_G_norm = (G / (G.norm() + 1e-8)).detach()
+
     def set_ori(self):
         self.tea_tag = False
     
@@ -207,6 +219,10 @@ class BNFeatureHook():
             np.savez(category_save_path, **npz_file)
         self.category_running_dd_var_list = torch.stack(self.category_running_dd_var_list, 0)
         self.category_running_dd_mean_list = torch.stack(self.category_running_dd_mean_list, 0)
+        if self.enable_struct:
+            M = self.category_running_dd_mean_list  # [C, d_l]
+            G = torch.cdist(M, M, p=2).pow(2)       # [C, C]
+            self.real_G_norm = (G / (G.norm() + 1e-8)).detach()
 
     @torch.no_grad()
     def pre_hook_fn(self, module, input, output):
@@ -264,7 +280,23 @@ class BNFeatureHook():
             self.loss_global_var = loss_global_var.detach()
             self.loss_class_mean = loss_class_mean.detach() if isinstance(loss_class_mean, torch.Tensor) else torch.tensor(float(loss_class_mean))
             self.loss_class_var = loss_class_var.detach() if isinstance(loss_class_var, torch.Tensor) else torch.tensor(float(loss_class_var))
-            
+
+            if self.enable_struct and hasattr(self, "real_G_norm"):
+                feat = input_0.mean([2, 3])  # [B, nch]
+                one_hot = F.one_hot(self.targets.long(), self.num_classes).to(feat.dtype)
+                counts = one_hot.sum(0)  # [C]
+                per_cls_sum = one_hot.t() @ feat  # [C, nch]
+                valid = counts > 0
+                denom = counts.clamp(min=1).unsqueeze(1)
+                per_cls_mean = per_cls_sum / denom
+                G_syn = torch.cdist(per_cls_mean, per_cls_mean, p=2).pow(2)
+                valid_mat = (valid.unsqueeze(0) & valid.unsqueeze(1)).to(feat.dtype)
+                G_syn_norm = G_syn / (G_syn.norm() + 1e-8)
+                diff = (G_syn_norm - self.real_G_norm) * valid_mat
+                self.loss_struct = diff.pow(2).sum()
+            else:
+                self.loss_struct = torch.tensor(0., device=input_0.device)
+
             self.r_feature = r_feature
         else:
             raise NotImplementedError("local category-aware is not implemented yet!")
@@ -277,7 +309,8 @@ import collections
 
 class ConvFeatureHook():
     def __init__(self, module=None, save_path="./", data_number=50000, name=None, gpu=0, training_momentum=0.4,
-                 drop_rate=0.4, flatness_weight=0, category_aware = 'global', class_num_list=None):
+                 drop_rate=0.4, flatness_weight=0, category_aware = 'global', class_num_list=None,
+                 num_classes=10, enable_struct=False):
         self.counter = collections.defaultdict(int)
         self.module = module
         if module is not None and name is not None:
@@ -293,11 +326,27 @@ class ConvFeatureHook():
         self.momentum = training_momentum  # origin = 0.2
         self.drop_rate = drop_rate  # 0.0 0.4 0.8
         
+        # BDPC fields
+        self.bdpc_beta = 0.
+        self.bdpc_cur_iter = 0
+        self.bdpc_max_iter = 1
+        self.bdpc_schedule = False
+        
         # Sub-component losses for logging
         self.loss_global_mean = torch.tensor(0.)
         self.loss_global_var = torch.tensor(0.)
         self.loss_class_mean = torch.tensor(0.)
         self.loss_class_var = torch.tensor(0.)
+        self.loss_bdpc = torch.tensor(0.)
+        
+        self.bias_dir_dd_mean_f1 = None       # (C,) global
+        self.bias_dir_dd_var_f1 = None        # (C,)
+        self.bias_dir_patch_mean_f1 = None    # (num_patches,)
+        self.bias_dir_patch_var_f1 = None     # (num_patches,)
+        self.bias_dir_cls_dd_mean = None      # (num_classes, C)
+        self.bias_dir_cls_dd_var = None       # (num_classes, C)
+        self.bias_dir_cls_patch_mean = None   # (num_classes, num_patches)
+        self.bias_dir_cls_patch_var = None    # (num_classes, num_patches)
         
         dir = os.path.join(save_path, "ConvFeatureHook", name)
         if not os.path.exists(dir):
@@ -321,7 +370,10 @@ class ConvFeatureHook():
             self.running_patch_mean = 0.
 
         self.category_aware = category_aware
-        
+        self.num_classes = num_classes
+        self.enable_struct = enable_struct
+        self.loss_struct = torch.tensor(0.)
+
         if class_num_list is not None:
             n = torch.tensor(class_num_list, dtype=torch.float)
             n_min, n_max = n.min(), n.max()
@@ -360,6 +412,10 @@ class ConvFeatureHook():
                 self.category_running_dd_mean_list = torch.stack(self.category_running_dd_mean_list,0)
                 self.category_running_patch_var_list = torch.stack(self.category_running_patch_var_list,0)
                 self.category_running_patch_mean_list = torch.stack(self.category_running_patch_mean_list,0)
+                if self.enable_struct:
+                    M = self.category_running_dd_mean_list  # [C, d_l]
+                    G = torch.cdist(M, M, p=2).pow(2)       # [C, C]
+                    self.real_G_norm = (G / (G.norm() + 1e-8)).detach()
 
     def set_ori(self):
         self.tea_tag = False
@@ -369,6 +425,18 @@ class ConvFeatureHook():
 
     def set_label(self,targets):
         self.targets = targets
+
+    def set_bias_direction(self, dd_mean_f1, dd_var_f1, patch_mean_f1, patch_var_f1,
+                           cls_dd_mean, cls_dd_var, cls_patch_mean, cls_patch_var):
+        """Set precomputed bias direction vectors for BDPC loss."""
+        self.bias_dir_dd_mean_f1 = dd_mean_f1          # (C,)
+        self.bias_dir_dd_var_f1 = dd_var_f1             # (C,)
+        self.bias_dir_patch_mean_f1 = patch_mean_f1     # (num_patches,)
+        self.bias_dir_patch_var_f1 = patch_var_f1       # (num_patches,)
+        self.bias_dir_cls_dd_mean = cls_dd_mean         # (num_classes, C)
+        self.bias_dir_cls_dd_var = cls_dd_var           # (num_classes, C)
+        self.bias_dir_cls_patch_mean = cls_patch_mean   # (num_classes, num_patches)
+        self.bias_dir_cls_patch_var = cls_patch_var     # (num_classes, num_patches)
 
     def set_return(self):
         self.return_tag = True
@@ -405,7 +473,11 @@ class ConvFeatureHook():
         self.category_running_dd_mean_list = torch.stack(self.category_running_dd_mean_list, 0)
         self.category_running_patch_var_list = torch.stack(self.category_running_patch_var_list, 0)
         self.category_running_patch_mean_list = torch.stack(self.category_running_patch_mean_list, 0)
-            
+        if self.enable_struct:
+            M = self.category_running_dd_mean_list  # [C, d_l]
+            G = torch.cdist(M, M, p=2).pow(2)       # [C, C]
+            self.real_G_norm = (G / (G.norm() + 1e-8)).detach()
+
     def set_hook(self, pre=True):
         if hasattr(self, "hook"):
             self.close()
@@ -506,7 +578,45 @@ class ConvFeatureHook():
             self.loss_global_var = loss_global_var.detach()
             self.loss_class_mean = loss_class_mean.detach() if isinstance(loss_class_mean, torch.Tensor) else torch.tensor(float(loss_class_mean))
             self.loss_class_var = loss_class_var.detach() if isinstance(loss_class_var, torch.Tensor) else torch.tensor(float(loss_class_var))
-            
+
+            if self.bdpc_beta > 0:
+                # form1: global bias direction
+                bdpc_loss = projection_loss(syn_dd_mean    - self.running_dd_mean,    self.bias_dir_dd_mean_f1) \
+                          + projection_loss(syn_dd_var     - self.running_dd_var,     self.bias_dir_dd_var_f1) \
+                          + projection_loss(syn_patch_mean - self.running_patch_mean, self.bias_dir_patch_mean_f1) \
+                          + projection_loss(syn_patch_var  - self.running_patch_var,  self.bias_dir_patch_var_f1)
+                # form2: per-class bias direction
+                unique_cls = self.targets.long().unique()
+                bdpc_f2 = sum(
+                    projection_loss(syn_dd_mean    - self.category_running_dd_mean_list[c],    self.bias_dir_cls_dd_mean[c]) +
+                    projection_loss(syn_dd_var     - self.category_running_dd_var_list[c],     self.bias_dir_cls_dd_var[c]) +
+                    projection_loss(syn_patch_mean - self.category_running_patch_mean_list[c], self.bias_dir_cls_patch_mean[c]) +
+                    projection_loss(syn_patch_var  - self.category_running_patch_var_list[c],  self.bias_dir_cls_patch_var[c])
+                    for c in unique_cls
+                ) / len(unique_cls)
+                iter_scale = (self.bdpc_cur_iter / self.bdpc_max_iter) ** 2 if self.bdpc_schedule else 1.0
+                bdpc_val = self.bdpc_beta * iter_scale * (bdpc_loss + bdpc_f2)
+                r_feature = r_feature + bdpc_val
+                self.loss_bdpc = bdpc_val.detach()
+            else:
+                self.loss_bdpc = torch.tensor(0.)
+
+            if self.enable_struct and hasattr(self, "real_G_norm"):
+                feat = input_0.mean([2, 3])  # [B, nch]
+                one_hot = F.one_hot(self.targets.long(), self.num_classes).to(feat.dtype)
+                counts = one_hot.sum(0)
+                per_cls_sum = one_hot.t() @ feat
+                valid = counts > 0
+                denom = counts.clamp(min=1).unsqueeze(1)
+                per_cls_mean = per_cls_sum / denom
+                G_syn = torch.cdist(per_cls_mean, per_cls_mean, p=2).pow(2)
+                valid_mat = (valid.unsqueeze(0) & valid.unsqueeze(1)).to(feat.dtype)
+                G_syn_norm = G_syn / (G_syn.norm() + 1e-8)
+                diff = (G_syn_norm - self.real_G_norm) * valid_mat
+                self.loss_struct = diff.pow(2).sum()
+            else:
+                self.loss_struct = torch.tensor(0., device=input_0.device)
+
             self.r_feature = r_feature
 
     def close(self):

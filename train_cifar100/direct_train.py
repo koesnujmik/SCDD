@@ -1,6 +1,7 @@
 import os
 import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import json
 import math
 import time
 import shutil
@@ -252,6 +253,10 @@ def get_args():
                         default='Temperature', help='wandb project name')
     parser.add_argument('--wandb-api-key', type=str,
                         default=None, help='wandb api key')
+    parser.add_argument('--wandb-run-id', type=str, default=None,
+                        help='resume an existing wandb run by ID (from recover stage)')
+    parser.add_argument('--wandb-run-name', type=str, default=None,
+                        help='wandb run display name; ignored if --wandb-run-id is set')
     parser.add_argument('--mix-type', default=None, type=str,
                         choices=['mixup', 'cutmix', None], help='mixup or cutmix or None')
     parser.add_argument('--fkd_seed', default=42, type=int,
@@ -287,8 +292,17 @@ def main():
 
 
 def main_worker(gpu, ngpus_per_node, args):
+    os.makedirs(args.output_dir, exist_ok=True)
+    if gpu == 0:
+        with open(os.path.join(args.output_dir, "args.json"), "w") as _f:
+            json.dump({k: (v if isinstance(v, (int, float, str, bool, list, dict, type(None))) else str(v))
+                       for k, v in vars(args).items()}, _f, indent=2)
     wandb.login(key=args.wandb_api_key)
-    wandb.init(project=args.wandb_project, name=args.output_dir.split('/')[-1])
+    if args.wandb_run_id:
+        wandb.init(project=args.wandb_project, id=args.wandb_run_id, resume="must")
+    else:
+        run_name = args.wandb_run_name or args.output_dir.split('/')[-1]
+        wandb.init(project=args.wandb_project, name=run_name)
     if args.distributed:
         args.rank = gpu
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
@@ -438,6 +452,19 @@ def main_worker(gpu, ngpus_per_node, args):
             'best_acc1': args.best_acc1,
             'optimizer': optimizer.state_dict(),
         }, is_best, output_dir=args.output_dir)
+
+    if gpu == 0:
+        _best = args.best_acc1
+        if hasattr(_best, "item"):
+            _best = _best.item()
+        with open(os.path.join(args.output_dir, "summary.json"), "w") as _f:
+            json.dump({
+                "best_acc1": float(_best),
+                "model_best_path": os.path.join(args.output_dir, "model_best.pth.tar"),
+                "checkpoint_path": os.path.join(args.output_dir, "checkpoint.pth.tar"),
+                "wandb_run_id": wandb.run.id if wandb.run else None,
+                "wandb_run_name": wandb.run.name if wandb.run else None,
+            }, _f, indent=2)
 
     wandb.finish()
     if args.distributed and dist.is_available() and dist.is_initialized():

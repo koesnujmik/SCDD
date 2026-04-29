@@ -4,9 +4,11 @@ import os
 import random
 import argparse
 import collections
+import json
 import time
+import faulthandler
 
-import time
+import wandb
 from tqdm import tqdm
 import ResNet_cifar
 import cifar100Imbanlance
@@ -28,6 +30,8 @@ import torch.distributed as dist
 from utils import *
 # import models as ti_models
 from baseline import get_network as ti_get_network
+
+faulthandler.enable(all_threads=True)
 
 def convnet3(nclass, logger=None):
     width = int(128)
@@ -77,12 +81,28 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier, ipc_id
         p.requires_grad = False
     hook_for_display = lambda x, y: validate(x, y, model_verifier)
 
+    if gpu == 0 and getattr(args, 'wandb_project', None):
+        wandb.login(key=getattr(args, 'wandb_api_key', None))
+        run_name = getattr(args, 'wandb_run_name', None) or args.exp_name
+        wandb.init(project=args.wandb_project, name=run_name, resume="never")
+        wandb.config.update({f"recover/{k}": v for k, v in vars(args).items()
+                             if k not in ("wandb_api_key",)})
+        run_sh_path = os.path.join(os.path.dirname(__file__), "..", "run100.sh")
+        if os.path.exists(run_sh_path):
+            wandb.save(os.path.abspath(run_sh_path), base_path=os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
     save_every = 100
     batch_size = args.batch_size
     best_cost = 1e4
     load_tag_dict = [True for i in range(len(model_teacher))]
     loss_r_feature_layers = [[] for _ in range(len(model_teacher))]
     load_tag = True
+
+    if args.adaptive_alpha:
+        _data_num = 50000 // 100
+        class_num_list = [int(_data_num * (args.imbanlance_rate ** (i / 99))) for i in range(100)]
+    else:
+        class_num_list = None
 
     for i, (_model_teacher) in enumerate(model_teacher):
         for name, module in _model_teacher.named_modules():
@@ -92,7 +112,8 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier, ipc_id
                                             name=full_name,
                                             gpu=gpu,training_momentum=args.training_momentum,
                                             flatness_weight=args.flatness_weight,
-                                            category_aware=args.category_aware)
+                                            category_aware=args.category_aware,
+                                            class_num_list=class_num_list)
                 _hook_module.set_hook(pre=True)
                 load_tag = load_tag & _hook_module.load_tag
                 load_tag_dict[i] = load_tag_dict[i] & _hook_module.load_tag
@@ -104,7 +125,8 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier, ipc_id
                                                gpu=gpu, training_momentum=args.training_momentum,
                                                drop_rate=args.drop_rate,
                                                flatness_weight=args.flatness_weight,
-                                               category_aware=args.category_aware)
+                                               category_aware=args.category_aware,
+                                               class_num_list=class_num_list)
                 _hook_module.set_hook(pre=True)
                 load_tag = load_tag & _hook_module.load_tag
                 load_tag_dict[i] = load_tag_dict[i] & _hook_module.load_tag
@@ -169,6 +191,71 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier, ipc_id
         for _loss_t_feature_layer in loss_r_feature_layers[j]:
             _loss_t_feature_layer.set_hook(pre=False)
 
+    if args.bdpc_beta > 0:
+        for i, (_model_teacher) in enumerate(model_teacher):
+            hook_idx = 0
+            for name, module in _model_teacher.named_modules():
+                full_name = str(_model_teacher.__class__.__name__) + "_" + str(args.aux_teacher[i]) + "=" + name
+                if isinstance(module, nn.BatchNorm2d):
+                    _hook = loss_r_feature_layers[i][hook_idx]
+                    bn_path = os.path.join(args.biased_statistic_path, "BNFeatureHook", full_name, "bn_running.npz")
+                    bn_npz = np.load(bn_path)
+                    bias_dir_mean_f1 = torch.from_numpy(bn_npz["running_mean"]).cuda(gpu) - module.running_mean.data
+                    bias_dir_var_f1 = torch.from_numpy(bn_npz["running_var"]).cuda(gpu) - module.running_var.data
+                    cls_mean_dirs = []
+                    cls_var_dirs = []
+                    for c in range(100):
+                        biased_cls_path = os.path.join(args.biased_statistic_path, "BNFeatureHook",
+                                                       f"class_{c}", full_name, "running.npz")
+                        biased_cls_npz = np.load(biased_cls_path)
+                        biased_cls_mean = torch.from_numpy(biased_cls_npz["running_dd_mean"]).cuda(gpu)
+                        biased_cls_var = torch.from_numpy(biased_cls_npz["running_dd_var"]).cuda(gpu)
+                        cls_mean_dirs.append(biased_cls_mean - _hook.category_running_dd_mean_list[c])
+                        cls_var_dirs.append(biased_cls_var - _hook.category_running_dd_var_list[c])
+                    _hook.set_bias_direction(
+                        bias_dir_mean_f1, bias_dir_var_f1,
+                        torch.stack(cls_mean_dirs, 0), torch.stack(cls_var_dirs, 0))
+                    _hook.bdpc_beta = args.bdpc_beta
+                    _hook.bdpc_schedule = args.bdpc_schedule
+                    hook_idx += 1
+                elif isinstance(module, nn.Conv2d):
+                    _hook = loss_r_feature_layers[i][hook_idx]
+                    biased_conv_path = os.path.join(args.biased_statistic_path, "ConvFeatureHook",
+                                                    full_name, "running.npz")
+                    biased_conv_npz = np.load(biased_conv_path)
+                    dd_mean_f1 = torch.from_numpy(biased_conv_npz["running_dd_mean"]).cuda(gpu) - _hook.running_dd_mean
+                    dd_var_f1 = torch.from_numpy(biased_conv_npz["running_dd_var"]).cuda(gpu) - _hook.running_dd_var
+                    patch_mean_f1 = torch.from_numpy(biased_conv_npz["running_patch_mean"]).cuda(gpu) - _hook.running_patch_mean
+                    patch_var_f1 = torch.from_numpy(biased_conv_npz["running_patch_var"]).cuda(gpu) - _hook.running_patch_var
+                    cls_dd_mean_dirs = []
+                    cls_dd_var_dirs = []
+                    cls_patch_mean_dirs = []
+                    cls_patch_var_dirs = []
+                    for c in range(100):
+                        biased_cls_path = os.path.join(args.biased_statistic_path, "ConvFeatureHook",
+                                                       f"class_{c}", full_name, "running.npz")
+                        biased_cls_npz = np.load(biased_cls_path)
+                        patch_stats_version = int(biased_cls_npz["patch_stats_version"]) if "patch_stats_version" in biased_cls_npz.files else 1
+                        if patch_stats_version >= 2:
+                            biased_patch_mean = torch.from_numpy(biased_cls_npz["running_patch_mean"]).cuda(gpu)
+                            biased_patch_var = torch.from_numpy(biased_cls_npz["running_patch_var"]).cuda(gpu)
+                        else:
+                            biased_patch_mean = torch.from_numpy(biased_cls_npz["running_patch_var"]).cuda(gpu)
+                            biased_patch_var = torch.from_numpy(biased_cls_npz["running_patch_mean"]).cuda(gpu)
+                        cls_dd_mean_dirs.append(
+                            torch.from_numpy(biased_cls_npz["running_dd_mean"]).cuda(gpu) - _hook.category_running_dd_mean_list[c])
+                        cls_dd_var_dirs.append(
+                            torch.from_numpy(biased_cls_npz["running_dd_var"]).cuda(gpu) - _hook.category_running_dd_var_list[c])
+                        cls_patch_mean_dirs.append(biased_patch_mean - _hook.category_running_patch_mean_list[c])
+                        cls_patch_var_dirs.append(biased_patch_var - _hook.category_running_patch_var_list[c])
+                    _hook.set_bias_direction(
+                        dd_mean_f1, dd_var_f1, patch_mean_f1, patch_var_f1,
+                        torch.stack(cls_dd_mean_dirs, 0), torch.stack(cls_dd_var_dirs, 0),
+                        torch.stack(cls_patch_mean_dirs, 0), torch.stack(cls_patch_var_dirs, 0))
+                    _hook.bdpc_beta = args.bdpc_beta
+                    _hook.bdpc_schedule = args.bdpc_schedule
+                    hook_idx += 1
+
     targets_all_all = torch.LongTensor(np.arange(100))[None, ...].expand(len(ipc_id_range), 100).contiguous().view(-1)
     ipc_id_all = torch.LongTensor(ipc_id_range)[..., None].expand(len(ipc_id_range), 100).contiguous().view(-1)
 
@@ -218,6 +305,13 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier, ipc_id
                 transforms.RandomResizedCrop(32, scale=(0.5, 1)),
                 transforms.RandomHorizontalFlip(),
             ]))
+
+            if args.bdpc_beta > 0:
+                for id_ in range(len(loss_r_feature_layers)):
+                    for mod in loss_r_feature_layers[id_]:
+                        mod.bdpc_cur_iter = iteration
+                        mod.bdpc_max_iter = max(iterations_per_layer - 1, 1)
+
             inputs_jit, inputs_ema_jit = aug_function(inputs, inputs_ema.value)
             # forward pass
             id = counter % len(model_teacher)
@@ -255,6 +349,30 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier, ipc_id
 
             loss = loss_ce + loss_aux
 
+            if args.gpu == 0:
+                total_global_mean = sum(mod.loss_global_mean.item() for mod in loss_r_feature_layers[id])
+                total_global_var  = sum(mod.loss_global_var.item()  for mod in loss_r_feature_layers[id])
+                total_class_mean  = sum(mod.loss_class_mean.item()  for mod in loss_r_feature_layers[id])
+                total_class_var   = sum(mod.loss_class_var.item()   for mod in loss_r_feature_layers[id])
+                total_bdpc        = sum(mod.loss_bdpc.item()        for mod in loss_r_feature_layers[id])
+                print(f"Iter [{iteration+1}/{iterations_per_layer}]  "
+                      f"loss={loss.item():.4f}  loss_ce={loss_ce.item():.4f}  "
+                      f"loss_r_feature={loss_r_feature.item():.4f}  loss_ema_ce={loss_ema_ce.item():.4f}  "
+                      f"[r_feat breakdown]  global_mean={total_global_mean:.4f}  global_var={total_global_var:.4f}  "
+                      f"class_mean={total_class_mean:.4f}  class_var={total_class_var:.4f}  bdpc={total_bdpc:.4f}")
+                if wandb.run is not None:
+                    wandb.log({
+                        "recover/loss":           loss.item(),
+                        "recover/loss_ce":        loss_ce.item(),
+                        "recover/loss_r_feature": loss_r_feature.item(),
+                        "recover/loss_ema_ce":    loss_ema_ce.item(),
+                        "recover/global_mean":    total_global_mean,
+                        "recover/global_var":     total_global_var,
+                        "recover/class_mean":     total_class_mean,
+                        "recover/class_var":      total_class_var,
+                        "recover/bdpc":           total_bdpc,
+                    })
+
             if iteration % save_every == 0 and args.gpu == 0:
                 print("------------iteration {}----------".format(iteration))
                 print("total loss", loss.item())
@@ -289,6 +407,15 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier, ipc_id
         # to reduce memory consumption by states of the optimizer we deallocate memory
         optimizer.state = collections.defaultdict(dict)
         torch.cuda.empty_cache()
+
+    if gpu == 0 and wandb.run is not None:
+        run_id_path = os.path.join(args.syn_data_path, "wandb_run_id.txt")
+        with open(run_id_path, "w") as f:
+            f.write(wandb.run.id)
+        wandb.finish()
+
+    if args.distributed and dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def save_images(args, images, targets, ipc_ids):
@@ -335,6 +462,116 @@ def validate(input, target, model):
     print("Verifier accuracy: ", prec1.item())
 
 
+def prepare_biased_statistics(args):
+    """Collect feature statistics from the biased expert model.
+
+    Mirrors the statistic-collection loop in main_worker() but runs on a
+    single GPU (cuda:0) before distributed training starts.  Saves:
+      - Per-class BN/Conv statistics  → args.biased_statistic_path
+      - BN layer running_mean/var     → .../BNFeatureHook/{name}/bn_running.npz
+    """
+    gpu = 0
+    aux_teacher = ["convnet"]
+
+    # --- build biased model ---
+    biased_model = convnet3(nclass=100)
+
+    # --- load biased checkpoint ---
+    checkpoint = torch.load(args.biased_expert_path, map_location="cpu")
+    from collections import OrderedDict
+    state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
+    new_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        new_state_dict[k.replace("module.", "")] = v
+    biased_model.load_state_dict(new_state_dict)
+    biased_model = biased_model.cuda(gpu).eval()
+    for p in biased_model.parameters():
+        p.requires_grad = False
+
+    # --- register hooks ---
+    biased_hooks = []
+    load_tag = True
+    for name, module in biased_model.named_modules():
+        full_name = str(biased_model.__class__.__name__) + "_" + str(aux_teacher[0]) + "=" + name
+        if isinstance(module, nn.BatchNorm2d):
+            _hook = BNFeatureHook(module, save_path=args.biased_statistic_path,
+                                  name=full_name, gpu=gpu,
+                                  training_momentum=args.training_momentum,
+                                  flatness_weight=args.flatness_weight,
+                                  category_aware=args.category_aware)
+            _hook.set_hook(pre=True)
+            load_tag = load_tag & _hook.load_tag
+            biased_hooks.append(('bn', full_name, _hook, module))
+        elif isinstance(module, nn.Conv2d):
+            _hook = ConvFeatureHook(module, save_path=args.biased_statistic_path,
+                                    name=full_name, gpu=gpu,
+                                    training_momentum=args.training_momentum,
+                                    drop_rate=args.drop_rate,
+                                    flatness_weight=args.flatness_weight,
+                                    category_aware=args.category_aware)
+            _hook.set_hook(pre=True)
+            load_tag = load_tag & _hook.load_tag
+            biased_hooks.append(('conv', full_name, _hook, module))
+
+    # --- also check if BN running stats are already saved ---
+    bn_running_saved = True
+    for hook_type, full_name, _hook, module in biased_hooks:
+        if hook_type == 'bn':
+            bn_path = os.path.join(args.biased_statistic_path, "BNFeatureHook", full_name, "bn_running.npz")
+            if not os.path.exists(bn_path):
+                bn_running_saved = False
+                break
+
+    if not load_tag:
+        train_dataset = cifar100Imbanlance.Cifar100Imbanlance(
+            transform=transforms.Compose([
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5071, 0.4867, 0.4408], [0.2675, 0.2565, 0.2761])
+            ]),
+            imbanlance_rate=args.imbanlance_rate, train=True, file_path=args.train_data_path)
+
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset, num_workers=0, batch_size=64, drop_last=False, shuffle=True)
+
+        print("[BDPC] Collecting biased expert statistics...")
+        with torch.no_grad():
+            total_seen = 0
+            for i, (data, targets) in tqdm(enumerate(train_loader)):
+                B = data.size(0)
+                data = data.cuda(gpu)
+                targets = targets.cuda(gpu)
+                for _, _, _hook, _ in biased_hooks:
+                    _hook.set_label(targets)
+                    if hasattr(_hook, "momentum"):
+                        _hook.momentum = B / float(total_seen + B + 1e-6)
+                _ = biased_model(data)
+                total_seen += B
+
+            for _, _, _hook, _ in biased_hooks:
+                _hook.save()
+        print("[BDPC] Biased expert statistics saved")
+    else:
+        print("[BDPC] Biased expert statistics already exist, skipping collection")
+
+    # --- save BN running_mean/var for form1 bias direction ---
+    if not bn_running_saved:
+        for hook_type, full_name, _hook, module in biased_hooks:
+            if hook_type == 'bn':
+                bn_dir = os.path.join(args.biased_statistic_path, "BNFeatureHook", full_name)
+                os.makedirs(bn_dir, exist_ok=True)
+                bn_path = os.path.join(bn_dir, "bn_running.npz")
+                np.savez(bn_path,
+                         running_mean=module.running_mean.data.cpu().numpy(),
+                         running_var=module.running_var.data.cpu().numpy())
+        print("[BDPC] BN running stats saved")
+
+    # cleanup hooks
+    for _, _, _hook, _ in biased_hooks:
+        _hook.close()
+
+
 def main_syn():
     parser = argparse.ArgumentParser(
         "G-VBSM: applying generalized matching for data condensation")
@@ -349,6 +586,8 @@ def main_syn():
                         help='name of the experiment, subfolder under syn_data_path')
     parser.add_argument('--imbanlance-rate', type=float, default=0.1,
                         help='0.1,0.05')
+    parser.add_argument('--adaptive-alpha', action='store_true',
+                        help='use class-adaptive alpha weighting: alpha_c=(n_c-n_min)/(n_max-n_min)')
     parser.add_argument('--ipc-number', type=int, default=10, help='the number of each ipc')
     parser.add_argument('--syn-data-path', type=str,
                         default='./syn_data', help='where to store synthetic data')
@@ -397,11 +636,42 @@ def main_syn():
                         help="the path of the CIFAR-100's training set")
     parser.add_argument('--statistic-path', type=str, default='./statistic',
                         help="the path of the statistic file")
+    parser.add_argument('--biased-expert-path', type=str, default=None,
+                        help='path to biased expert checkpoint')
+    parser.add_argument('--biased-statistic-path', type=str, default='./biased_statistic',
+                        help='directory to save/load biased observer statistics')
+    parser.add_argument('--bdpc-beta', type=float, default=0.0,
+                        help='base BDPC weight; 0 disables BDPC')
+    parser.add_argument('--bdpc-schedule', action='store_true', default=False,
+                        help='quadratic iter scaling of BDPC beta')
+    parser.add_argument('--wandb-project', type=str, default=None,
+                        help='wandb project name; if set, enables wandb logging')
+    parser.add_argument('--wandb-api-key', type=str, default=None,
+                        help='wandb API key')
+    parser.add_argument('--wandb-run-name', type=str, default=None,
+                        help='wandb run name prefix (defaults to --exp-name)')
     args = parser.parse_args()
 
-    args.syn_data_path = os.path.join(args.syn_data_path, args.exp_name)
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+
+    if args.bdpc_beta > 0:
+        print(f"BDPC enabled with beta={args.bdpc_beta}, preparing biased statistics...")
+        prepare_biased_statistics(args)
+
+    # If --syn-data-path is absolute, treat it as the explicit output dir
+    # (experiments/{exp_name}/recovers/{recover_id}/syn_data) and skip the
+    # legacy "<base>/<exp_name>" composition.
+    if not os.path.isabs(args.syn_data_path):
+        args.syn_data_path = os.path.join(args.syn_data_path, args.exp_name)
     if not os.path.exists(args.syn_data_path):
-        os.makedirs(args.syn_data_path)
+        os.makedirs(args.syn_data_path, exist_ok=True)
+
+    # Dump args.json one level up from syn_data so the artifact dir captures it.
+    _args_dir = os.path.dirname(os.path.abspath(args.syn_data_path))
+    os.makedirs(_args_dir, exist_ok=True)
+    with open(os.path.join(_args_dir, "args.json"), "w") as _f:
+        json.dump({k: (v if isinstance(v, (int, float, str, bool, list, dict, type(None))) else str(v))
+                   for k, v in vars(args).items()}, _f, indent=2)
 
     aux_teacher = ["convnet"]
     args.aux_teacher = aux_teacher
@@ -431,7 +701,6 @@ def main_syn():
 
     model_verifier = model_teacher[0]
     ipc_id_range = list(range(0, args.ipc_number))
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
     ngpus_per_node = torch.cuda.device_count()
     if ngpus_per_node < 1:
         raise RuntimeError("No CUDA device is visible. Check CUDA_VISIBLE_DEVICES and the NVIDIA driver state.")

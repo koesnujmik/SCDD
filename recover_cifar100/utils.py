@@ -101,6 +101,13 @@ def denormalize(image_tensor, use_fp16=False):
 
 
 
+def projection_loss(residual, direction):
+    numer = torch.sum(residual * direction)
+    denom = torch.sum(direction * direction)
+    safe = torch.isfinite(numer) & torch.isfinite(denom) & (denom > 1e-6)
+    zeros = numer.new_zeros(())
+    return torch.where(safe, numer.square() / denom.clamp_min(1e-6), zeros)
+
 class EMA(object):
     def __init__(self, alpha, initial_value=None):
         self.alpha = alpha
@@ -116,7 +123,7 @@ class EMA(object):
 
 class BNFeatureHook():
     def __init__(self, module, save_path="./", training_momentum=0.4, name=None, gpu=0, flatness_weight=0,
-                      category_aware = 'global'):
+                      category_aware = 'global', class_num_list=None):
         self.module = module
         if module is not None and name is not None:
             self.hook = module.register_forward_hook(self.post_hook_fn)
@@ -129,6 +136,30 @@ class BNFeatureHook():
         self.tea_tag = False
         self.return_tag = False
         self.flatness_weight = flatness_weight
+        # Sub-component losses for logging
+        self.loss_global_mean = torch.tensor(0.)
+        self.loss_global_var = torch.tensor(0.)
+        self.loss_class_mean = torch.tensor(0.)
+        self.loss_class_var = torch.tensor(0.)
+        # BDPC fields
+        self.bdpc_beta = 0.
+        self.bdpc_cur_iter = 0
+        self.bdpc_max_iter = 1
+        self.bdpc_schedule = False
+        self.loss_bdpc = torch.tensor(0.)
+        self.bias_dir_mean_f1 = None
+        self.bias_dir_var_f1 = None
+        self.bias_dir_cls_mean = None
+        self.bias_dir_cls_var = None
+
+        if class_num_list is not None:
+            n = torch.tensor(class_num_list, dtype=torch.float)
+            n_min, n_max = n.min(), n.max()
+            alpha = 1 - ((n - n_min) / (n_max - n_min))
+            self.alpha_per_class = alpha.cuda(gpu)
+        else:
+            self.alpha_per_class = None
+
         for i in range(100):
             cls_dir = os.path.join(save_path, f"BNFeatureHook", f"class_{i}", name)
             if not os.path.exists(cls_dir):
@@ -173,6 +204,13 @@ class BNFeatureHook():
         """
         self.targets = targets
 
+    def set_bias_direction(self, mean_f1, var_f1, cls_mean, cls_var):
+        """Set precomputed bias direction vectors for BDPC loss."""
+        self.bias_dir_mean_f1 = mean_f1
+        self.bias_dir_var_f1 = var_f1
+        self.bias_dir_cls_mean = cls_mean  # (num_classes, C)
+        self.bias_dir_cls_var = cls_var    # (num_classes, C)
+
     def set_hook(self, pre=True):
         if hasattr(self, "hook"):
             self.close()
@@ -190,6 +228,8 @@ class BNFeatureHook():
                         "running_dd_mean": self.category_running_dd_mean_list[i].cpu().numpy() if isinstance(self.category_running_dd_mean_list[i],
                                                                                         torch.Tensor) else self.category_running_dd_mean_list[i]}
             np.savez(category_save_path, **npz_file)
+        self.category_running_dd_var_list = torch.stack(self.category_running_dd_var_list, 0)
+        self.category_running_dd_mean_list = torch.stack(self.category_running_dd_mean_list, 0)
 
     @torch.no_grad()
     def pre_hook_fn(self, module, input, output):
@@ -221,12 +261,46 @@ class BNFeatureHook():
                 else:
                     self.dd_var = self.momentum * self.dd_var + (1 - self.momentum) * var
                     self.dd_mean = self.momentum * self.dd_mean + (1 - self.momentum) * mean
-            r_feature = (torch.norm(module.running_var.data - (self.dd_var + var - var.detach()), 2) + \
-                        torch.norm(module.running_mean.data - (self.dd_mean + mean - mean.detach()), 2)) * 0.5
-            category_dd_var = self.category_running_dd_var_list[self.targets.long()].mean(0)
-            category_dd_mean = self.category_running_dd_mean_list[self.targets.long()].mean(0)
-            r_feature += (torch.norm(category_dd_var - (self.dd_var + var - var.detach()), 2) + \
-                        torch.norm(category_dd_mean - (self.dd_mean + mean - mean.detach()), 2)) * 0.5
+            syn_mean = self.dd_mean + mean - mean.detach()
+            syn_var = self.dd_var + var - var.detach()
+            loss_global_mean = torch.norm(module.running_mean.data - syn_mean, 2)
+            loss_global_var = torch.norm(module.running_var.data - syn_var, 2)
+
+            if self.alpha_per_class is not None:
+                batch_cls = self.targets.long()
+                mean_alpha = self.alpha_per_class[batch_cls].mean()
+                unique_cls = batch_cls.unique()
+                loss_class_mean = sum((1 - self.alpha_per_class[c]) * torch.norm(self.category_running_dd_mean_list[c] - syn_mean, 2) for c in unique_cls) / len(unique_cls)
+                loss_class_var = sum((1 - self.alpha_per_class[c]) * torch.norm(self.category_running_dd_var_list[c] - syn_var, 2) for c in unique_cls) / len(unique_cls)
+                r_feature = (loss_global_mean + loss_global_var) * mean_alpha + loss_class_mean + loss_class_var
+            else:
+                category_dd_var = self.category_running_dd_var_list[self.targets.long()].mean(0)
+                category_dd_mean = self.category_running_dd_mean_list[self.targets.long()].mean(0)
+                loss_class_mean = torch.norm(category_dd_mean - syn_mean, 2)
+                loss_class_var = torch.norm(category_dd_var - syn_var, 2)
+                r_feature = (loss_global_var + loss_global_mean) * 0.5 + (loss_class_var + loss_class_mean) * 0.5
+
+            self.loss_global_mean = loss_global_mean.detach()
+            self.loss_global_var = loss_global_var.detach()
+            self.loss_class_mean = loss_class_mean.detach() if isinstance(loss_class_mean, torch.Tensor) else torch.tensor(float(loss_class_mean))
+            self.loss_class_var = loss_class_var.detach() if isinstance(loss_class_var, torch.Tensor) else torch.tensor(float(loss_class_var))
+
+            if self.bdpc_beta > 0 and self.bias_dir_mean_f1 is not None:
+                bdpc_loss = projection_loss(syn_mean - module.running_mean.data, self.bias_dir_mean_f1) \
+                          + projection_loss(syn_var  - module.running_var.data,  self.bias_dir_var_f1)
+                unique_cls = self.targets.long().unique()
+                bdpc_f2 = sum(
+                    projection_loss(syn_mean - self.category_running_dd_mean_list[c], self.bias_dir_cls_mean[c]) +
+                    projection_loss(syn_var  - self.category_running_dd_var_list[c],  self.bias_dir_cls_var[c])
+                    for c in unique_cls
+                ) / len(unique_cls)
+                iter_scale = (self.bdpc_cur_iter / self.bdpc_max_iter) ** 2 if self.bdpc_schedule else 1.0
+                bdpc_val = self.bdpc_beta * iter_scale * (bdpc_loss + bdpc_f2)
+                r_feature = r_feature + bdpc_val
+                self.loss_bdpc = bdpc_val.detach()
+            else:
+                self.loss_bdpc = torch.tensor(0.)
+
             self.r_feature = r_feature
         else:
             if self.tea_tag:
@@ -263,7 +337,7 @@ class BNFeatureHook():
 
 class ConvFeatureHook():
     def __init__(self, module=None, save_path="./", data_number=50000, name=None, gpu=0, training_momentum=0.4,
-                 drop_rate=0.4, flatness_weight=0, category_aware = 'global'):
+                 drop_rate=0.4, flatness_weight=0, category_aware = 'global', class_num_list=None):
 
         self.module = module
         if module is not None and name is not None:
@@ -278,6 +352,29 @@ class ConvFeatureHook():
         self.flatness_weight = flatness_weight
         self.momentum = training_momentum  # origin = 0.2
         self.drop_rate = drop_rate  # 0.0 0.4 0.8
+
+        # BDPC fields
+        self.bdpc_beta = 0.
+        self.bdpc_cur_iter = 0
+        self.bdpc_max_iter = 1
+        self.bdpc_schedule = False
+
+        # Sub-component losses for logging
+        self.loss_global_mean = torch.tensor(0.)
+        self.loss_global_var = torch.tensor(0.)
+        self.loss_class_mean = torch.tensor(0.)
+        self.loss_class_var = torch.tensor(0.)
+        self.loss_bdpc = torch.tensor(0.)
+
+        self.bias_dir_dd_mean_f1 = None
+        self.bias_dir_dd_var_f1 = None
+        self.bias_dir_patch_mean_f1 = None
+        self.bias_dir_patch_var_f1 = None
+        self.bias_dir_cls_dd_mean = None
+        self.bias_dir_cls_dd_var = None
+        self.bias_dir_cls_patch_mean = None
+        self.bias_dir_cls_patch_var = None
+
         dir = os.path.join(save_path, "ConvFeatureHook", name)
         if not os.path.exists(dir):
             os.makedirs(dir, exist_ok=True)
@@ -300,6 +397,15 @@ class ConvFeatureHook():
             self.running_patch_mean = 0.
 
         self.category_aware = category_aware
+
+        if class_num_list is not None:
+            n = torch.tensor(class_num_list, dtype=torch.float)
+            n_min, n_max = n.min(), n.max()
+            alpha = 1 - ((n - n_min) / (n_max - n_min))
+            self.alpha_per_class = alpha.cuda(gpu)
+        else:
+            self.alpha_per_class = None
+
         if category_aware == "global":
             self.category_save_path_list = [
                 os.path.join(save_path, f"ConvFeatureHook", f"class_{i}", name, "running.npz") for i in range(100)
@@ -340,9 +446,21 @@ class ConvFeatureHook():
     def set_label(self,targets):
         self.targets = targets
 
+    def set_bias_direction(self, dd_mean_f1, dd_var_f1, patch_mean_f1, patch_var_f1,
+                           cls_dd_mean, cls_dd_var, cls_patch_mean, cls_patch_var):
+        """Set precomputed bias direction vectors for BDPC loss."""
+        self.bias_dir_dd_mean_f1 = dd_mean_f1
+        self.bias_dir_dd_var_f1 = dd_var_f1
+        self.bias_dir_patch_mean_f1 = patch_mean_f1
+        self.bias_dir_patch_var_f1 = patch_var_f1
+        self.bias_dir_cls_dd_mean = cls_dd_mean
+        self.bias_dir_cls_dd_var = cls_dd_var
+        self.bias_dir_cls_patch_mean = cls_patch_mean
+        self.bias_dir_cls_patch_var = cls_patch_var
+
     def set_return(self):
         self.return_tag = True
-    
+
     def remove_return(self):
         self.return_tag = False
 
@@ -366,12 +484,17 @@ class ConvFeatureHook():
                                                                                       torch.Tensor) else self.category_running_dd_var_list[i],
                         "running_dd_mean": self.category_running_dd_mean_list[i].cpu().numpy() if isinstance(self.category_running_dd_mean_list[i],
                                                                                         torch.Tensor) else self.category_running_dd_mean_list[i],
-                        "running_patch_var": self.category_running_patch_mean_list[i].cpu().numpy() if isinstance(self.category_running_patch_mean_list[i],
+                        "running_patch_mean": self.category_running_patch_mean_list[i].cpu().numpy() if isinstance(self.category_running_patch_mean_list[i],
                                                                                             torch.Tensor) else self.category_running_patch_mean_list[i],
-                        "running_patch_mean": self.category_running_patch_var_list[i].cpu().numpy() if isinstance(self.category_running_patch_var_list[i],
-                                                                                              torch.Tensor) else self.category_running_patch_var_list[i]}
+                        "running_patch_var": self.category_running_patch_var_list[i].cpu().numpy() if isinstance(self.category_running_patch_var_list[i],
+                                                                                              torch.Tensor) else self.category_running_patch_var_list[i],
+                        "patch_stats_version": 2}
             np.savez(category_save_path, **npz_file)
-            
+        self.category_running_dd_var_list = torch.stack(self.category_running_dd_var_list, 0)
+        self.category_running_dd_mean_list = torch.stack(self.category_running_dd_mean_list, 0)
+        self.category_running_patch_var_list = torch.stack(self.category_running_patch_var_list, 0)
+        self.category_running_patch_mean_list = torch.stack(self.category_running_patch_mean_list, 0)
+
     def set_hook(self, pre=True):
         if hasattr(self, "hook"):
             self.close()
@@ -484,7 +607,7 @@ class ConvFeatureHook():
             new_input_0 = F.interpolate(input_0, [new_h, new_w], mode="bilinear")
             new_input_0 = einops.rearrange(new_input_0, "b c (u h) (v w) -> (u v) (b c h w)", h=4, w=4).contiguous()
             patch_mean = new_input_0.mean([1])
-            patch_var = new_input_0.var([1], unbiased=False)        
+            patch_var = new_input_0.var([1], unbiased=False)
             with torch.no_grad():
                 if isinstance(self.dd_var, int):
                     self.dd_var = dd_var
@@ -497,20 +620,54 @@ class ConvFeatureHook():
                     self.patch_var = self.momentum * self.patch_var + (1 - self.momentum) * patch_var
                     self.patch_mean = self.momentum * self.patch_mean + (1 - self.momentum) * patch_mean
 
-            r_feature = (torch.norm(self.running_dd_var - (self.dd_var + dd_var - dd_var.detach()), 2) + \
-                        torch.norm(self.running_dd_mean - (self.dd_mean + dd_mean - dd_mean.detach()), 2) + \
-                        torch.norm(self.running_patch_mean - (self.patch_mean + patch_mean - patch_mean.detach()), 2) + \
-                        torch.norm(self.running_patch_var - (self.patch_var + patch_var - patch_var.detach()), 2)) * 0.5
+            syn_dd_mean = self.dd_mean + dd_mean - dd_mean.detach()
+            syn_dd_var = self.dd_var + dd_var - dd_var.detach()
+            syn_patch_mean = self.patch_mean + patch_mean - patch_mean.detach()
+            syn_patch_var = self.patch_var + patch_var - patch_var.detach()
 
-            category_dd_var = self.category_running_dd_var_list[self.targets.long()].mean(0)
-            category_dd_mean = self.category_running_dd_mean_list[self.targets.long()].mean(0)
-            category_patch_var = self.category_running_patch_var_list[self.targets.long()].mean(0)
-            category_patch_mean = self.category_running_patch_mean_list[self.targets.long()].mean(0)
+            loss_global_mean = torch.norm(self.running_dd_mean - syn_dd_mean, 2) + torch.norm(self.running_patch_mean - syn_patch_mean, 2)
+            loss_global_var = torch.norm(self.running_dd_var - syn_dd_var, 2) + torch.norm(self.running_patch_var - syn_patch_var, 2)
 
-            r_feature += (torch.norm(category_dd_var - (self.dd_var + dd_var - dd_var.detach()), 2) + \
-                        torch.norm(category_dd_mean - (self.dd_mean + dd_mean - dd_mean.detach()), 2) + \
-                        torch.norm(category_patch_mean - (self.patch_mean + patch_mean - patch_mean.detach()), 2) + \
-                        torch.norm(category_patch_var - (self.patch_var + patch_var - patch_var.detach()), 2)) * 0.5
+            if self.alpha_per_class is not None:
+                batch_cls = self.targets.long()
+                mean_alpha = self.alpha_per_class[batch_cls].mean()
+                unique_cls = batch_cls.unique()
+                loss_class_mean = sum((1 - self.alpha_per_class[c]) * (torch.norm(self.category_running_dd_mean_list[c] - syn_dd_mean, 2) + torch.norm(self.category_running_patch_mean_list[c] - syn_patch_mean, 2)) for c in unique_cls) / len(unique_cls)
+                loss_class_var = sum((1 - self.alpha_per_class[c]) * (torch.norm(self.category_running_dd_var_list[c] - syn_dd_var, 2) + torch.norm(self.category_running_patch_var_list[c] - syn_patch_var, 2)) for c in unique_cls) / len(unique_cls)
+                r_feature = (loss_global_mean + loss_global_var) * mean_alpha + loss_class_mean + loss_class_var
+            else:
+                category_dd_var = self.category_running_dd_var_list[self.targets.long()].mean(0)
+                category_dd_mean = self.category_running_dd_mean_list[self.targets.long()].mean(0)
+                category_patch_var = self.category_running_patch_var_list[self.targets.long()].mean(0)
+                category_patch_mean = self.category_running_patch_mean_list[self.targets.long()].mean(0)
+                loss_class_mean = torch.norm(category_dd_mean - syn_dd_mean, 2) + torch.norm(category_patch_mean - syn_patch_mean, 2)
+                loss_class_var = torch.norm(category_dd_var - syn_dd_var, 2) + torch.norm(category_patch_var - syn_patch_var, 2)
+                r_feature = (loss_global_mean + loss_global_var + loss_class_mean + loss_class_var) * 0.5
+
+            self.loss_global_mean = loss_global_mean.detach()
+            self.loss_global_var = loss_global_var.detach()
+            self.loss_class_mean = loss_class_mean.detach() if isinstance(loss_class_mean, torch.Tensor) else torch.tensor(float(loss_class_mean))
+            self.loss_class_var = loss_class_var.detach() if isinstance(loss_class_var, torch.Tensor) else torch.tensor(float(loss_class_var))
+
+            if self.bdpc_beta > 0 and self.bias_dir_dd_mean_f1 is not None:
+                bdpc_loss = projection_loss(syn_dd_mean    - self.running_dd_mean,    self.bias_dir_dd_mean_f1) \
+                          + projection_loss(syn_dd_var     - self.running_dd_var,     self.bias_dir_dd_var_f1) \
+                          + projection_loss(syn_patch_mean - self.running_patch_mean, self.bias_dir_patch_mean_f1) \
+                          + projection_loss(syn_patch_var  - self.running_patch_var,  self.bias_dir_patch_var_f1)
+                unique_cls = self.targets.long().unique()
+                bdpc_f2 = sum(
+                    projection_loss(syn_dd_mean    - self.category_running_dd_mean_list[c],    self.bias_dir_cls_dd_mean[c]) +
+                    projection_loss(syn_dd_var     - self.category_running_dd_var_list[c],     self.bias_dir_cls_dd_var[c]) +
+                    projection_loss(syn_patch_mean - self.category_running_patch_mean_list[c], self.bias_dir_cls_patch_mean[c]) +
+                    projection_loss(syn_patch_var  - self.category_running_patch_var_list[c],  self.bias_dir_cls_patch_var[c])
+                    for c in unique_cls
+                ) / len(unique_cls)
+                iter_scale = (self.bdpc_cur_iter / self.bdpc_max_iter) ** 2 if self.bdpc_schedule else 1.0
+                bdpc_val = self.bdpc_beta * iter_scale * (bdpc_loss + bdpc_f2)
+                r_feature = r_feature + bdpc_val
+                self.loss_bdpc = bdpc_val.detach()
+            else:
+                self.loss_bdpc = torch.tensor(0.)
 
             self.r_feature = r_feature
 

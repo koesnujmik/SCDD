@@ -56,7 +56,7 @@ def init_images(args, model=None):
             normalize,
         ]
     )
-    
+
     if args.subset == 'tinyimagenet':
         trainset = tinyImbalance.TinyImbanlance(transform=transform,imbanlance_rate=args.imbanlance_rate, train=True,file_path=os.path.join(''))
     elif args.subset == 'cifar10':

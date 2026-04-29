@@ -198,7 +198,7 @@ def prepare_folders(args):
     for folder in folders_util:
         if not os.path.exists(folder):
             print('creating folder ' + folder)
-            os.mkdir(folder)
+            os.makedirs(folder, exist_ok=True)
 
 def save_checkpoint(args, state, is_best, epoch):
     filename = '%s/%s/ckpt.pth.tar' % (args.root_model, args.store_name)
