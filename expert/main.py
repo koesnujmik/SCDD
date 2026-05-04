@@ -24,6 +24,34 @@ from Trainer import Trainer
 
 best_acc1 = 0
 
+
+def seed_everything(seed):
+    if seed is None:
+        return
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    cudnn.deterministic = True
+    cudnn.benchmark = False
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def make_generator(seed, offset=0):
+    if seed is None:
+        return None
+    generator = torch.Generator()
+    generator.manual_seed(int(seed) + int(offset))
+    return generator
+
 def convnet3(nclass, logger=None):
     width = int(128)
     model = ConvNet(nclass,
@@ -102,14 +130,7 @@ def main():
     with open(os.path.join(args.root_model, args.store_name, "args.json"), "w") as _f:
         json.dump({k: (v if isinstance(v, (int, float, str, bool, list, dict, type(None))) else str(v))
                    for k, v in vars(args).items()}, _f, indent=2)
-    if args.seed is not None:
-        random.seed(args.seed)
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
-        torch.cuda.manual_seed(args.seed)
-        torch.cuda.manual_seed_all(args.seed)
-        cudnn.deterministic = True
-        cudnn.benchmark = True
+    seed_everything(args.seed)
     main_worker(args.gpu, args)
 
 def main_worker(gpu, args):
@@ -160,8 +181,15 @@ def main_worker(gpu, args):
 
     cls_num_list = train_dataset.get_per_class_num()
     train_sampler = None
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),num_workers=args.workers, persistent_workers=True,pin_memory=True, sampler=train_sampler,drop_last=True)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,num_workers=args.workers, persistent_workers=True,pin_memory=True)
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+        num_workers=args.workers, persistent_workers=True, pin_memory=True,
+        sampler=train_sampler, drop_last=True, worker_init_fn=seed_worker,
+        generator=make_generator(args.seed, 0))
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.workers, persistent_workers=True, pin_memory=True,
+        worker_init_fn=seed_worker, generator=make_generator(args.seed, 1))
 
     cls_num_list = [0] * num_classes
     for label in train_dataset.targets:
@@ -176,8 +204,13 @@ def main_worker(gpu, args):
     samples_weight = np.array([cls_weight[t] for t in train_dataset.targets])
     samples_weight = torch.from_numpy(samples_weight)
     samples_weight = samples_weight.double()
-    weighted_sampler = torch.utils.data.WeightedRandomSampler(samples_weight, len(samples_weight),replacement=True)
-    weighted_train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size,num_workers=args.workers, persistent_workers=True,pin_memory=True,sampler=weighted_sampler)
+    weighted_sampler = torch.utils.data.WeightedRandomSampler(
+        samples_weight, len(samples_weight), replacement=True,
+        generator=make_generator(args.seed, 2))
+    weighted_train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=args.batch_size, num_workers=args.workers,
+        persistent_workers=True, pin_memory=True, sampler=weighted_sampler,
+        worker_init_fn=seed_worker, generator=make_generator(args.seed, 3))
 
     cls_num_list_cuda = torch.from_numpy(np.array(cls_num_list)).float().cuda()
     start_time = time.time()

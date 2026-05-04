@@ -1,5 +1,5 @@
 from argument import args
-from synthesize.main import main as synth_main
+from synthesize.main import main as synth_main, seed_everything
 import json
 import os
 import warnings
@@ -7,6 +7,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 if __name__ == "__main__":
+    seed_everything(args.seed)
     # Dump args.json next to syn_data so the artifact has a hyperparam record.
     # syn_data_path is "<artifact_dir>/syn_data"; place args.json one level up.
     _args_json_dir = os.path.dirname(os.path.abspath(args.syn_data_path))

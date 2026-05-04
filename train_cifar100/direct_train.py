@@ -6,6 +6,7 @@ import math
 import time
 import shutil
 import argparse
+import random
 import numpy as np
 from convnet import ConvNet
 import wandb
@@ -99,6 +100,35 @@ from torch.utils.data._utils.fetch import _MapDatasetFetcher
 import torch
 import torch.nn as nn
 
+
+def seed_everything(seed):
+    if seed is None:
+        return
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def make_generator(seed, offset=0):
+    if seed is None:
+        return None
+    generator = torch.Generator()
+    generator.manual_seed(int(seed) + int(offset))
+    return generator
+
+
 def convnet3(nclass, logger=None):
     width = int(128)
     model = ConvNet(nclass,
@@ -110,6 +140,28 @@ def convnet3(nclass, logger=None):
     if logger is not None:
         logger(f"=> creating model convnet-3, norm: instance")
     return model
+
+
+def build_cifar_model(arch_name, num_classes):
+    if arch_name == "convnet":
+        return convnet3(nclass=num_classes)
+    if arch_name == "resnet18":
+        return ResNet_cifar.resnet18(num_class=num_classes)
+    if arch_name == "resnet32":
+        return ResNet_cifar.resnet32(num_class=num_classes)
+    if arch_name == "resnet34":
+        return ResNet_cifar.resnet34(num_class=num_classes)
+    raise ValueError(
+        f"Unsupported CIFAR model arch '{arch_name}'. "
+        "Supported values: convnet, resnet18, resnet32, resnet34"
+    )
+
+
+def load_checkpoint_state_dict(path):
+    checkpoint = torch.load(path, map_location="cpu")
+    state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
+    return {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+
 
 def cosine_similarity(a, b, eps=1e-5):
     return (a * b).sum(1) / (a.norm(dim=1) * b.norm(dim=1) + eps)
@@ -241,6 +293,8 @@ def get_args():
                         default="0,1", help='the id of gpu used')
     parser.add_argument('--model', type=str,
                         default='resnet18', help='student model name')
+    parser.add_argument('--teacher-arch', type=str,
+                        default='convnet', help='teacher model architecture')
     parser.add_argument('--shuffle-patch', default=False, action='store_true',
                     help='if use shuffle-patch')
     parser.add_argument('--keep-topk', type=int, default=100,
@@ -261,11 +315,15 @@ def get_args():
                         choices=['mixup', 'cutmix', None], help='mixup or cutmix or None')
     parser.add_argument('--fkd_seed', default=42, type=int,
                         help='seed for batch loading sampler')
+    parser.add_argument('--seed', default=None, type=int,
+                        help='seed for Python, NumPy, PyTorch, CUDA, and DataLoader workers')
     parser.add_argument('--world-size', default=1, type=int,
                         help='number of nodes for distributed training')
 
     args = parser.parse_args()
 
+    if args.seed is None:
+        args.seed = args.fkd_seed
     args.mode = 'fkd_load'
     return args
 
@@ -274,6 +332,7 @@ def main():
     args = get_args()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+    seed_everything(args.seed)
     ngpus_per_node = torch.cuda.device_count()
     if ngpus_per_node < 1:
         raise RuntimeError("No CUDA device is visible. Check CUDA_VISIBLE_DEVICES and the NVIDIA driver state.")
@@ -309,6 +368,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                 world_size=args.world_size, rank=args.rank)
     else:
         args.rank = 0
+    seed_everything(int(args.seed) + int(args.rank))
     if not torch.cuda.is_available():
         raise Exception("need gpu to train!")
 
@@ -333,7 +393,9 @@ def main_worker(gpu, ngpus_per_node, args):
     grad_scaler = torch.cuda.amp.GradScaler()
     train_sampler = None
     if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            train_dataset, seed=args.seed)
+    loader_seed_offset = args.rank * 1000
     train_loader = DataLoaderX(
         train_dataset,
         batch_size=args.batch_size,
@@ -341,6 +403,8 @@ def main_worker(gpu, ngpus_per_node, args):
         sampler=train_sampler,
         num_workers=args.workers,
         pin_memory=True,
+        worker_init_fn=seed_worker,
+        generator=make_generator(args.seed, loader_seed_offset),
     )
 
     # load validation data
@@ -350,43 +414,30 @@ def main_worker(gpu, ngpus_per_node, args):
                                                    normalize,
                                                ]))
     val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
+        val_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.workers, pin_memory=True, worker_init_fn=seed_worker,
+        generator=make_generator(args.seed, loader_seed_offset + 1))
     print('load data successfully')
 
     # load student model
     print("=> loading student model '{}'".format(args.model))
-    if args.model == 'convnet':
-        model = convnet3(nclass=100)
-    else:
-        model = ti_models.model_dict[args.model](num_classes=100)
-    model = nn.DataParallel(model).cuda()
+    model = build_cifar_model(args.model, num_classes=100)
+    model = model.cuda()
     model.train()
     ema_model = EMAMODEL(model)
     args.mode = "fkd_save"
     args.batch_size = args.batch_size // (args.gradient_accumulation_steps * ngpus_per_node)
-    args.teacher_name = ["convnet"]
+    args.teacher_name = [args.teacher_arch]
     model_teacher = []
     for name in args.teacher_name:
         print("=> loading teacher models '{}'".format(name))
-        if name == "resnet32":
-            _model = ResNet_cifar.resnet32(num_class=100)
-        elif name == "convnet":
-            _model = convnet3(nclass=100)
-            _model = torch.nn.DataParallel(_model)
-        elif name in ["ConvNetW128","ConvNetD1","ConvNetD2","ConvNetW32"]:
-            _model = ti_get_network(name, channel=3, num_classes=100, im_size=(32, 32), dist=False)
-        else:
-            _model = ti_models.model_dict[name](num_classes=100)
+        _model = build_cifar_model(name, num_classes=100)
+        _model.load_state_dict(load_checkpoint_state_dict(args.pre_train_path))
         model_teacher.append(_model)
-        if name == "resnet32":
-            checkpoint = torch.load(os.path.join(args.pre_train_path, f""),map_location="cpu")
-        elif name == "convnet":
-            checkpoint = torch.load(args.pre_train_path,map_location="cpu")
-        model_teacher[-1].load_state_dict(checkpoint['state_dict'])
 
     for _model in model_teacher:
         _model.cuda()
-        _model = torch.nn.DataParallel(_model)    
+        # _model = torch.nn.DataParallel(_model)
 
     if args.sgd:
         optimizer = torch.optim.SGD(get_parameters(model),

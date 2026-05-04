@@ -155,7 +155,11 @@ def _score_center(model, flat_images, m, keep_limit):
 
 
 def _score_kmeans(model, flat_images, images, m, keep_limit, n):
-    """KMeans on penultimate features. Sort by distance to assigned centroid ascending."""
+    """KMeans on penultimate features. Sort by distance to assigned centroid ascending.
+
+    Returns scores, selected_img_ids, cluster_info where cluster_info is a dict
+    holding per-raw-image cluster assignment and the actual cluster count.
+    """
     from sklearn.cluster import KMeans
 
     feats = _extract_features(model, flat_images, keep_limit, m)  # [keep_limit, D]
@@ -173,7 +177,12 @@ def _score_kmeans(model, flat_images, images, m, keep_limit, n):
 
     # Scores shape [m, keep_limit]: use tiled distances so the selection loop works uniformly
     scores = dists.unsqueeze(0).expand(m, -1).clone()
-    return scores, selected_img_ids
+    cluster_info = {
+        'cluster_labels': assigned.numpy(),  # [keep_limit]
+        'n_clusters': int(n_clusters),
+        'distances': dists.numpy(),
+    }
+    return scores, selected_img_ids, cluster_info
 
 
 def _score_shrinkage_kmeans(model, flat_images, m, keep_limit, n, mipc, imbanlance_rate):
@@ -211,7 +220,8 @@ def _score_shrinkage_kmeans(model, flat_images, m, keep_limit, n, mipc, imbanlan
     return scores, selected_img_ids
 
 
-def selector(n, model, images, labels, size, m=3, cls_id=0, method='original', imbanlance_rate=0.01, n_class=100):
+def selector(n, model, images, labels, size, m=3, cls_id=0, method='original',
+             imbanlance_rate=0.01, n_class=100, return_meta=False):
     """
     Multi-round selection over keep_limit real images.
     Each (real image, augmentation) pair is selected at most once.
@@ -220,24 +230,36 @@ def selector(n, model, images, labels, size, m=3, cls_id=0, method='original', i
         images:  Tensor [mipc, m, 3, H, W]
         labels:  Tensor [mipc]
         method:  'original' | 'entropy_low' | 'kmeans'
+        return_meta: when True, returns (selected_images, meta_dict) with
+            keep_limit, n_clusters, cluster_labels (kmeans only) and a list
+            of per-selected-image dicts {ipc_id, source_img_id, source_aug_id}.
     Returns:
         selected_images: [n, 3, H, W]
+        (optionally) meta dict
     """
     with torch.no_grad():
         mipc = images.shape[0]
         device = images.device
         s = images.shape  # [mipc, m, 3, H, W]
 
-        keep_limit = int(mipc * (imbanlance_rate ** (cls_id / n_class-1)))
+        keep_limit = int(mipc * (imbanlance_rate ** (cls_id / (n_class-1))))
         keep_limit = min(mipc, keep_limit)
         if keep_limit == 0:
-            return torch.empty((0, 3, s[3], s[4]), device=device)
+            empty = torch.empty((0, 3, s[3], s[4]), device=device)
+            if return_meta:
+                return empty, {
+                    'keep_limit': 0, 'n_clusters': 0,
+                    'cluster_labels': None, 'selected': [],
+                }
+            return empty
 
         images = images.cuda().permute(1, 0, 2, 3, 4)  # [m, mipc, 3, H, W]
         images = images[:, :keep_limit]                # [m, keep_limit, 3, H, W]
         labels = labels[:keep_limit].repeat(m).cuda()  # [m * keep_limit]
 
         flat_images = images.reshape(m * keep_limit, s[2], s[3], s[4])
+
+        cluster_info = None
 
         # ── Phase 1: scoring (method-specific) ────────────────────────────
         if method == 'original':
@@ -257,7 +279,7 @@ def selector(n, model, images, labels, size, m=3, cls_id=0, method='original', i
                 model, pad(flat_images, size), m, keep_limit)
 
         elif method == 'kmeans':
-            scores, selected_img_ids = _score_kmeans(
+            scores, selected_img_ids, cluster_info = _score_kmeans(
                 model, pad(flat_images, size), images, m, keep_limit, n)
 
         elif method == 'shrinkage_kmeans':
@@ -274,6 +296,7 @@ def selector(n, model, images, labels, size, m=3, cls_id=0, method='original', i
 
         selected = []
         selected_pairs = set()
+        selected_meta = []  # ordered by ipc_id
 
         while len(selected) < n:
             for img_id in selected_img_ids:
@@ -292,6 +315,11 @@ def selector(n, model, images, labels, size, m=3, cls_id=0, method='original', i
 
                 used_mask[best_aug_idx, img_id] = True
                 selected.append(images[best_aug_idx, img_id])
+                selected_meta.append({
+                    'ipc_id': len(selected) - 1,
+                    'source_img_id': int(img_id.item()),
+                    'source_aug_id': int(best_aug_idx),
+                })
 
                 if len(selected) == n:
                     break
@@ -303,6 +331,15 @@ def selector(n, model, images, labels, size, m=3, cls_id=0, method='original', i
         selected_images = torch.stack(selected, dim=0).detach()
 
     torch.cuda.empty_cache()
+
+    if return_meta:
+        meta = {
+            'keep_limit': int(keep_limit),
+            'n_clusters': int(cluster_info['n_clusters']) if cluster_info is not None else 0,
+            'cluster_labels': cluster_info['cluster_labels'] if cluster_info is not None else None,
+            'selected': selected_meta,
+        }
+        return selected_images, meta
     return selected_images  # [n, 3, H, W]
 
 

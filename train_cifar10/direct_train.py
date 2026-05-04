@@ -6,6 +6,7 @@ import time
 import shutil
 import argparse
 import faulthandler
+import random
 import ResNet_cifar
 from convnet import ConvNet
 import numpy as np
@@ -33,6 +34,34 @@ from utils import AverageMeter, accuracy, get_parameters
 faulthandler.enable(all_threads=True)
 
 
+def seed_everything(seed):
+    if seed is None:
+        return
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def make_generator(seed, offset=0):
+    if seed is None:
+        return None
+    generator = torch.Generator()
+    generator.manual_seed(int(seed) + int(offset))
+    return generator
+
+
 normalize = transforms.Normalize([0.5071, 0.4867, 0.4408],
                                     [0.2675, 0.2565, 0.2761])
 
@@ -45,7 +74,8 @@ class BalancedBatchSampler(torch.utils.data.Sampler):
     """매 배치에 모든 클래스를 n_per_class개씩 확정적으로 포함.
     batch_size는 num_classes의 배수여야 함.
     """
-    def __init__(self, dataset, batch_size):
+    def __init__(self, dataset, batch_size, generator=None):
+        self.generator = generator
         self.n_classes = len(dataset.classes)
         assert batch_size % self.n_classes == 0, (
             f"batch_size({batch_size})는 num_classes({self.n_classes})의 배수여야 합니다")
@@ -59,7 +89,8 @@ class BalancedBatchSampler(torch.utils.data.Sampler):
         self.n_batches = min(len(idxs) for idxs in self.class_indices) // self.n_per_class
 
     def __iter__(self):
-        shuffled = [torch.randperm(len(idxs)).tolist() for idxs in self.class_indices]
+        shuffled = [torch.randperm(len(idxs), generator=self.generator).tolist()
+                    for idxs in self.class_indices]
         for b in range(self.n_batches):
             batch = []
             for c in range(self.n_classes):
@@ -145,6 +176,28 @@ def convnet3(nclass, logger=None):
     if logger is not None:
         logger(f"=> creating model convnet-3, norm: instance")
     return model
+
+
+def build_cifar_model(arch_name, num_classes):
+    if arch_name == "convnet":
+        return convnet3(nclass=num_classes)
+    if arch_name == "resnet18":
+        return ResNet_cifar.resnet18(num_class=num_classes)
+    if arch_name == "resnet32":
+        return ResNet_cifar.resnet32(num_class=num_classes)
+    if arch_name == "resnet34":
+        return ResNet_cifar.resnet34(num_class=num_classes)
+    raise ValueError(
+        f"Unsupported CIFAR model arch '{arch_name}'. "
+        "Supported values: convnet, resnet18, resnet32, resnet34"
+    )
+
+
+def load_checkpoint_state_dict(path):
+    checkpoint = torch.load(path, map_location="cpu")
+    state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
+    return {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+
 
 def cosine_similarity(a, b, eps=1e-5):
     return (a * b).sum(1) / (a.norm(dim=1) * b.norm(dim=1) + eps)
@@ -301,6 +354,8 @@ def get_args():
                         default="0,1", help='the id of gpu used')
     parser.add_argument('--model', type=str,
                         default='resnet18', help='student model name')
+    parser.add_argument('--teacher-arch', type=str,
+                        default='convnet', help='teacher model architecture')
     parser.add_argument('--shuffle-patch', default=False, action='store_true',
                     help='if use shuffle-patch')
     parser.add_argument('--keep-topk', type=int, default=10,
@@ -321,6 +376,8 @@ def get_args():
                         choices=['mixup', 'cutmix', None], help='mixup or cutmix or None')
     parser.add_argument('--fkd_seed', default=42, type=int,
                         help='seed for batch loading sampler')
+    parser.add_argument('--seed', default=None, type=int,
+                        help='seed for Python, NumPy, PyTorch, CUDA, and DataLoader workers')
     parser.add_argument('--world-size', default=1, type=int,
                         help='number of nodes for distributed training')
     parser.add_argument('--supcon-weight', type=float, default=0.0,
@@ -332,6 +389,8 @@ def get_args():
 
     args = parser.parse_args()
 
+    if args.seed is None:
+        args.seed = args.fkd_seed
     args.mode = 'fkd_load'
     return args
 
@@ -340,6 +399,7 @@ def main():
     args = get_args()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+    seed_everything(args.seed)
     ngpus_per_node = torch.cuda.device_count()
     if ngpus_per_node < 1:
         raise RuntimeError("No CUDA device is visible. Check CUDA_VISIBLE_DEVICES and the NVIDIA driver state.")
@@ -375,6 +435,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                 world_size=args.world_size, rank=args.rank)
     else:
         args.rank = 0
+    seed_everything(int(args.seed) + int(args.rank))
     if not torch.cuda.is_available():
         raise Exception("need gpu to train!")
 
@@ -398,14 +459,21 @@ def main_worker(gpu, ngpus_per_node, args):
         ]))
 
     grad_scaler = torch.cuda.amp.GradScaler()
+    loader_seed_offset = args.rank * 1000
     if args.balanced_sampling:
-        batch_sampler = BalancedBatchSampler(train_dataset, batch_size=args.batch_size)
+        batch_sampler = BalancedBatchSampler(
+            train_dataset, batch_size=args.batch_size,
+            generator=make_generator(args.seed, loader_seed_offset))
         train_loader = DataLoaderX(
-            train_dataset, batch_sampler=batch_sampler, num_workers=args.workers, pin_memory=False)
+            train_dataset, batch_sampler=batch_sampler, num_workers=args.workers,
+            pin_memory=False, worker_init_fn=seed_worker,
+            generator=make_generator(args.seed, loader_seed_offset + 1))
     else:
         train_loader = DataLoaderX(
             train_dataset, batch_size=args.batch_size, shuffle=True,
-            num_workers=args.workers, pin_memory=False)
+            num_workers=args.workers, pin_memory=False,
+            worker_init_fn=seed_worker,
+            generator=make_generator(args.seed, loader_seed_offset))
 
     # load validation data
     val_dataset = torchvision.datasets.CIFAR10(root=args.val_dir, train=False, download=True,
@@ -414,72 +482,27 @@ def main_worker(gpu, ngpus_per_node, args):
                                                    normalize,
                                                ]))
     val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
+        val_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.workers, pin_memory=True, worker_init_fn=seed_worker,
+        generator=make_generator(args.seed, loader_seed_offset + 2))
     print('load data successfully')
 
     # load student model
     print("=> loading student model '{}'".format(args.model))
-    if args.model == 'convnet':
-        model = convnet3(nclass=10)
-    else:
-        model = ti_models.model_dict[args.model](num_classes=10)
+    model = build_cifar_model(args.model, num_classes=10)
     model = model.cuda()
     model.train()
     ema_model = EMAMODEL(model)
     args.mode = "fkd_save"
     args.batch_size = args.batch_size // (args.gradient_accumulation_steps * ngpus_per_node)
-    aux_teacher =["convnet"]
+    aux_teacher = [args.teacher_arch]
     args.aux_teacher = args.teacher_name = aux_teacher
     model_teacher = []
     for name in aux_teacher:
-        if name == "resnet32":
-            _model = ResNet_cifar.resnet32(num_class=10)
-        elif name == "convnet":
-            _model = convnet3(nclass=10)
-            # _model = torch.nn.DataParallel(_model)
-        elif name in ["resnet18","mobilenet_v2","efficientnet_b0","shufflenet_v2_x0_5"]:
-            _model = models.__dict__[name](pretrained=False, num_classes=10)
-            if name == "resnet18":
-                _model.conv1 = nn.Conv2d(
-                    3, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False
-                )
-                _model.maxpool = nn.Identity()
-                _model.fc = nn.Linear(_model.fc.in_features, 10)
-            elif name == "mobilenet_v2":
-                _model.features[0][0] = nn.Conv2d(
-                    3, _model.features[0][0].out_channels, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False
-                )
-                _model.classifier[1] = nn.Linear(_model.classifier[1].in_features,10)
-            elif name == "efficientnet_b0":
-                _model.features[0][0] = nn.Conv2d(
-                    3, _model.features[0][0].out_channels, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False
-                )
-                _model.classifier[1] = nn.Linear(_model.classifier[1].in_features,10)
-            elif name == "shufflenet_v2_x0_5":
-                _model.conv1 = nn.Conv2d(
-                    3, _model.conv1[0].out_channels, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False
-                )
-                _model.maxpool = nn.Identity()
-                _model.fc = nn.Linear(_model.fc.in_features,10)
-        else:
-            if name in ["ConvNetW128","ConvNetD1", "ConvNetD2", "ConvNetW32"]:
-                _model = ti_get_network(name, channel=3, num_classes=10, im_size=(32, 32), dist=False)
-            else:
-                _model = ti_models.model_dict[name](num_classes=10)
+        print("=> loading teacher model '{}'".format(name))
+        _model = build_cifar_model(name, num_classes=10)
+        _model.load_state_dict(load_checkpoint_state_dict(args.pre_train_path))
         model_teacher.append(_model)
-        if name == "resnet32":
-            checkpoint = torch.load(os.path.join(args.pre_train_path, f""),map_location="cpu")
-        elif name == "convnet":
-            checkpoint = torch.load(args.pre_train_path, map_location="cpu")
-            
-            state_dict = checkpoint['state_dict']
-            from collections import OrderedDict
-            checkpoint = OrderedDict()
-            for k, v in state_dict.items():
-                name_key = k.replace("module.", "")
-                checkpoint[name_key] = v
-            
-        model_teacher[-1].load_state_dict(checkpoint)
         
 
     for _model in model_teacher:

@@ -177,6 +177,13 @@ parser.add_argument(
     default="../expert/root/model/dataset: cifar10#arch: convnet#imbanlance_rate: 0.01#2026-03-27 21:25:57/ckpt.best.pth.tar",
     help="path to the pretrained expert model checkpoint",
 )
+parser.add_argument(
+    "--cluster-stat-path",
+    type=str,
+    default=None,
+    help="if set, save per-cluster activation stats and manifest.json under this dir "
+         "(only valid with --selection-method kmeans and --factor 1)",
+)
 args = parser.parse_args()
 
 

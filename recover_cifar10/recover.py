@@ -33,6 +33,34 @@ from baseline import get_network as ti_get_network
 faulthandler.enable(all_threads=True)
 
 
+def seed_everything(seed):
+    if seed is None:
+        return
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def make_generator(seed, offset=0):
+    if seed is None:
+        return None
+    generator = torch.Generator()
+    generator.manual_seed(int(seed) + int(offset))
+    return generator
+
+
 def SupConLoss(features, labels, temperature=0.1):
     """Supervised Contrastive Loss (Khosla et al. 2020).
     features: [N, dim] unnormalized embeddings
@@ -71,39 +99,33 @@ class ApplyTransformToPair:
         img2_transformed = self.transform(img2)
 
         return img1_transformed, img2_transformed
-    
+
+
+def build_cifar_model(arch_name, num_classes):
+    if arch_name == "convnet":
+        return ti_models.model_dict["convnet"](num_classes=num_classes)
+    if arch_name == "resnet18":
+        return ResNet_cifar.resnet18(num_class=num_classes)
+    if arch_name == "resnet32":
+        return ResNet_cifar.resnet32(num_class=num_classes)
+    if arch_name == "resnet34":
+        return ResNet_cifar.resnet34(num_class=num_classes)
+    raise ValueError(
+        f"Unsupported teacher arch '{arch_name}'. "
+        "Supported values: convnet, resnet18, resnet32, resnet34"
+    )
+
+
+def load_checkpoint_state_dict(path):
+    checkpoint = torch.load(path, map_location="cpu")
+    state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
+    return {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+
+
 def random_backbone(args,gpu):
     random_init_backbone = []
     for name in args.aux_teacher:
-        if name in ["resnet18","mobilenet_v2","efficientnet_b0","shufflenet_v2_x0_5"]:
-            model = models.__dict__[name](pretrained=False, num_classes=10)
-            if name == "resnet18":
-                model.conv1 = nn.Conv2d(
-                    3, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False
-                )
-                model.maxpool = nn.Identity()
-                model.fc = nn.Linear(model.fc.in_features, 10)
-            elif name == "mobilenet_v2":
-                model.features[0][0] = nn.Conv2d(
-                    3, model.features[0][0].out_channels, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False
-                )
-                model.classifier[1] = nn.Linear(model.classifier[1].in_features,10)
-            elif name == "efficientnet_b0":
-                model.features[0][0] = nn.Conv2d(
-                    3, model.features[0][0].out_channels, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False
-                )
-                model.classifier[1] = nn.Linear(model.classifier[1].in_features,10)
-            elif name == "shufflenet_v2_x0_5":
-                model.conv1 = nn.Conv2d(
-                    3, model.conv1[0].out_channels, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False
-                )
-                model.maxpool = nn.Identity()
-                model.fc = nn.Linear(model.fc.in_features,10)
-        else:
-            if name in ["ConvNetW128","ConvNetD1","ConvNetD2","ConvNetW32"]:
-                model = ti_get_network(name, channel=3, num_classes=10, im_size=(32, 32), dist=False)
-            else:
-                model = ti_models.model_dict[name](num_classes=10)
+        model = build_cifar_model(name, num_classes=10)
         random_init_backbone.append(model.cuda(gpu).eval())
     for _random_init_backbone in random_init_backbone:
         for p in _random_init_backbone.parameters():
@@ -123,6 +145,8 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier, ipc_id
         args.rank = 0
 
     torch.cuda.set_device(args.gpu)
+    worker_seed = int(args.seed) + int(args.rank)
+    seed_everything(worker_seed)
     model_teacher = [_model_teacher.cuda(gpu).eval() for _model_teacher in model_teacher]
 
     for _model_teacher in model_teacher:
@@ -157,6 +181,37 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier, ipc_id
     else:
         class_num_list = None
 
+    # Resolve cluster matching state once: read manifest and build the
+    # (num_classes, ipc) -> cluster_id map. We require manifest existence
+    # whenever cluster_loss_weight > 0 and a path is given so that silent
+    # mis-pairings between initial and recover artifacts surface immediately.
+    cluster_stat_path = getattr(args, 'cluster_stat_path', None)
+    cluster_loss_weight = float(getattr(args, 'cluster_loss_weight', 0.0))
+    ipc_to_cluster = None
+    if cluster_stat_path is not None and cluster_loss_weight > 0:
+        manifest_path = os.path.join(cluster_stat_path, "manifest.json")
+        if not os.path.exists(manifest_path):
+            raise FileNotFoundError(
+                f"--cluster-loss-weight>0 but manifest not found at {manifest_path}"
+            )
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        if int(manifest.get('num_classes', 10)) != 10:
+            raise ValueError(
+                f"recover_cifar10 expects 10 classes, manifest reports "
+                f"{manifest.get('num_classes')}"
+            )
+        if int(manifest.get('ipc', args.ipc_number)) != int(args.ipc_number):
+            raise ValueError(
+                f"manifest ipc={manifest.get('ipc')} != recover ipc={args.ipc_number}"
+            )
+        ipc_to_cluster = torch.full((10, args.ipc_number), -1, dtype=torch.long)
+        for cls_id_str, cls_data in manifest['classes'].items():
+            c = int(cls_id_str)
+            for entry in cls_data['selected']:
+                ipc_to_cluster[c, int(entry['ipc_id'])] = int(entry['cluster_id'])
+        print(f"[Cluster] Loaded manifest with weight={cluster_loss_weight} from {manifest_path}")
+
     for i, (_model_teacher) in enumerate(model_teacher):
         for name, module in _model_teacher.named_modules():
             full_name = str(_model_teacher.__class__.__name__) + "_" + str(args.aux_teacher[i]) + "=" + name
@@ -168,7 +223,10 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier, ipc_id
                                             category_aware=args.category_aware,
                                             class_num_list=class_num_list,
                                             num_classes=10,
-                                            enable_struct=(args.struct_weight > 0))
+                                            enable_struct=(args.struct_weight > 0),
+                                            cluster_stat_path=cluster_stat_path,
+                                            ipc_to_cluster=ipc_to_cluster,
+                                            cluster_loss_weight=cluster_loss_weight)
                 _hook_module.set_hook(pre=True)
                 load_tag = load_tag & _hook_module.load_tag
                 load_tag_dict[i] = load_tag_dict[i] & _hook_module.load_tag
@@ -183,7 +241,10 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier, ipc_id
                                                category_aware=args.category_aware,
                                                class_num_list=class_num_list,
                                                num_classes=10,
-                                               enable_struct=(args.struct_weight > 0))
+                                               enable_struct=(args.struct_weight > 0),
+                                               cluster_stat_path=cluster_stat_path,
+                                               ipc_to_cluster=ipc_to_cluster,
+                                               cluster_loss_weight=cluster_loss_weight)
                 _hook_module.set_hook(pre=True)
                 load_tag = load_tag & _hook_module.load_tag
                 load_tag_dict[i] = load_tag_dict[i] & _hook_module.load_tag
@@ -221,7 +282,9 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier, ipc_id
                                                    num_workers=4,
                                                    batch_size=64,
                                                    drop_last=False,
-                                                   shuffle=True)
+                                                   shuffle=True,
+                                                   worker_init_fn=seed_worker,
+                                                   generator=make_generator(args.seed, args.rank * 1000))
 
         with torch.no_grad():
             for j, _model_teacher in enumerate(model_teacher):
@@ -412,7 +475,7 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier, ipc_id
             # forward pass
             id = counter % len(model_teacher)
             for mod in loss_r_feature_layers[id]:
-                mod.set_label(targets)
+                mod.set_label(targets, ipc_ids=ipc_ids)
             counter += 1
             optimizer.zero_grad()
             for (idx, mod) in enumerate(loss_r_feature_layers[id]):
@@ -482,12 +545,15 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier, ipc_id
                 total_class_mean  = sum(mod.loss_class_mean.item()  for mod in loss_r_feature_layers[id])
                 total_class_var   = sum(mod.loss_class_var.item()   for mod in loss_r_feature_layers[id])
                 total_bdpc        = sum(mod.loss_bdpc.item()        for mod in loss_r_feature_layers[id])
+                total_cluster_mean = sum(mod.loss_cluster_mean.item() for mod in loss_r_feature_layers[id])
+                total_cluster_var  = sum(mod.loss_cluster_var.item()  for mod in loss_r_feature_layers[id])
                 print(f"Iter [{iteration+1}/{iterations_per_layer}]  "
                       f"loss={loss.item():.4f}  loss_ce={loss_ce.item():.4f}  "
                       f"loss_r_feature={loss_r_feature.item():.4f}  loss_ema_ce={loss_ema_ce.item():.4f}  "
                       f"loss_supcon={loss_supcon.item():.4f}  loss_struct={loss_struct.item():.4f}  "
                       f"[r_feat breakdown]  global_mean={total_global_mean:.4f}  global_var={total_global_var:.4f}  "
-                      f"class_mean={total_class_mean:.4f}  class_var={total_class_var:.4f}  bdpc={total_bdpc:.4f}")
+                      f"class_mean={total_class_mean:.4f}  class_var={total_class_var:.4f}  bdpc={total_bdpc:.4f}  "
+                      f"cluster_mean={total_cluster_mean:.4f}  cluster_var={total_cluster_var:.4f}")
                 if wandb.run is not None:
                     wandb.log({
                         "recover/loss":           loss.item(),
@@ -501,6 +567,8 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier, ipc_id
                         "recover/class_mean":     total_class_mean,
                         "recover/class_var":      total_class_var,
                         "recover/bdpc":           total_bdpc,
+                        "recover/cluster_mean":   total_cluster_mean,
+                        "recover/cluster_var":    total_cluster_var,
                     })
 
             if iteration % save_every == 0 and args.gpu == 0:
@@ -613,42 +681,13 @@ def prepare_biased_statistics(args):
       - BN layer running_mean/var     → .../BNFeatureHook/{name}/bn_running.npz
     """
     gpu = 0
-    aux_teacher = ["convnet"]
+    aux_teacher = [args.arch_name]
 
     # --- build biased model (same arch as debiased teacher) ---
-    for arch_name in aux_teacher:
-        if arch_name == "resnet32":
-            biased_model = ResNet_cifar.resnet32(num_class=10)
-        elif arch_name in ["resnet18", "mobilenet_v2", "efficientnet_b0", "shufflenet_v2_x0_5"]:
-            biased_model = models.__dict__[arch_name](pretrained=False, num_classes=10)
-            if arch_name == "resnet18":
-                biased_model.conv1 = nn.Conv2d(3, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
-                biased_model.maxpool = nn.Identity()
-                biased_model.fc = nn.Linear(biased_model.fc.in_features, 10)
-            elif arch_name == "mobilenet_v2":
-                biased_model.features[0][0] = nn.Conv2d(3, biased_model.features[0][0].out_channels, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
-                biased_model.classifier[1] = nn.Linear(biased_model.classifier[1].in_features, 10)
-            elif arch_name == "efficientnet_b0":
-                biased_model.features[0][0] = nn.Conv2d(3, biased_model.features[0][0].out_channels, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
-                biased_model.classifier[1] = nn.Linear(biased_model.classifier[1].in_features, 10)
-            elif arch_name == "shufflenet_v2_x0_5":
-                biased_model.conv1 = nn.Conv2d(3, biased_model.conv1[0].out_channels, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
-                biased_model.maxpool = nn.Identity()
-                biased_model.fc = nn.Linear(biased_model.fc.in_features, 10)
-        else:
-            if arch_name in ["ConvNetW128", "ConvNetD1", "ConvNetD2", "ConvNetW32"]:
-                biased_model = ti_get_network(arch_name, channel=3, num_classes=10, im_size=(32, 32), dist=False)
-            else:
-                biased_model = ti_models.model_dict[arch_name](num_classes=10)
+    biased_model = build_cifar_model(args.arch_name, num_classes=10)
 
     # --- load biased checkpoint ---
-    checkpoint = torch.load(args.biased_expert_path, map_location="cpu")
-    from collections import OrderedDict
-    state_dict = checkpoint['state_dict']
-    new_state_dict = OrderedDict()
-    for k, v in state_dict.items():
-        new_state_dict[k.replace("module.", "")] = v
-    biased_model.load_state_dict(new_state_dict)
+    biased_model.load_state_dict(load_checkpoint_state_dict(args.biased_expert_path))
     biased_model = biased_model.cuda(gpu).eval()
     for p in biased_model.parameters():
         p.requires_grad = False
@@ -699,7 +738,8 @@ def prepare_biased_statistics(args):
             imbanlance_rate=args.imbanlance_rate, train=True, file_path=args.train_data_path)
 
         train_loader = torch.utils.data.DataLoader(
-            train_dataset, num_workers=0, batch_size=64, drop_last=False, shuffle=True)
+            train_dataset, num_workers=0, batch_size=64, drop_last=False, shuffle=True,
+            worker_init_fn=seed_worker, generator=make_generator(args.seed, 5000))
 
         print("[BDPC] Collecting biased expert statistics...")
         with torch.no_grad():
@@ -822,9 +862,16 @@ def main_syn():
                         help='temperature for SupCon loss in recovery stage')
     parser.add_argument('--struct-weight', type=float, default=0.0,
                         help='weight lambda for Inter-Class Structure Matching (ICSM) loss (0 = off)')
+    parser.add_argument('--cluster-stat-path', type=str, default=None,
+                        help='directory containing manifest.json + per-cluster activation stats from initial')
+    parser.add_argument('--cluster-loss-weight', type=float, default=0.0,
+                        help='weight for cluster mean/var matching loss (0 = off)')
+    parser.add_argument('--seed', default=42, type=int,
+                        help='seed for Python, NumPy, PyTorch, CUDA, and DataLoader workers')
     args = parser.parse_args()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+    seed_everything(args.seed)
 
     if args.bdpc_beta > 0:
         print(f"BDPC enabled with beta={args.bdpc_beta}, preparing biased statistics...")
@@ -845,56 +892,13 @@ def main_syn():
         json.dump({k: (v if isinstance(v, (int, float, str, bool, list, dict, type(None))) else str(v))
                    for k, v in vars(args).items()}, _f, indent=2)
 
-    aux_teacher = ["convnet"]
+    aux_teacher = [args.arch_name]
     args.aux_teacher = aux_teacher
     model_teacher = []
     for name in aux_teacher:
-        if name == "resnet32":
-            model = ResNet_cifar.resnet32(num_class=10)
-        elif name in ["resnet18","mobilenet_v2","efficientnet_b0","shufflenet_v2_x0_5"]:
-            model = models.__dict__[name](pretrained=False, num_classes=10)
-            if name == "resnet18":
-                model.conv1 = nn.Conv2d(
-                    3, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False
-                )
-                model.maxpool = nn.Identity()
-                model.fc = nn.Linear(model.fc.in_features, 10)
-            elif name == "mobilenet_v2":
-                model.features[0][0] = nn.Conv2d(
-                    3, model.features[0][0].out_channels, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False
-                )
-                model.classifier[1] = nn.Linear(model.classifier[1].in_features,10)
-            elif name == "efficientnet_b0":
-                model.features[0][0] = nn.Conv2d(
-                    3, model.features[0][0].out_channels, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False
-                )
-                model.classifier[1] = nn.Linear(model.classifier[1].in_features,10)
-            elif name == "shufflenet_v2_x0_5":
-                model.conv1 = nn.Conv2d(
-                    3, model.conv1[0].out_channels, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False
-                )
-                model.maxpool = nn.Identity()
-                model.fc = nn.Linear(model.fc.in_features,10)
-        else:
-            if name in ["ConvNetW128","ConvNetD1","ConvNetD2","ConvNetW32"]:
-                model = ti_get_network(name, channel=3, num_classes=10, im_size=(32, 32), dist=False)
-            else:
-                model = ti_models.model_dict[name](num_classes=10)
+        model = build_cifar_model(name, num_classes=10)
+        model.load_state_dict(load_checkpoint_state_dict(args.pre_train_path))
         model_teacher.append(model)
-        if name == "resnet32":
-            checkpoint = torch.load(os.path.join(args.pre_train_path, f""),map_location="cpu")
-            model_teacher[-1].load_state_dict(checkpoint['state_dict'])
-        else:
-            checkpoint = torch.load(args.pre_train_path, map_location="cpu")
-            
-            from collections import OrderedDict
-            state_dict = checkpoint['state_dict']
-            checkpoint = OrderedDict()
-            for k, v in state_dict.items():
-                name_key = k.replace("module.", "")
-                checkpoint[name_key] = v
-            
-            model_teacher[-1].load_state_dict(checkpoint)
 
     model_verifier = model_teacher[0]
     ipc_id_range = list(range(0, args.ipc_number))

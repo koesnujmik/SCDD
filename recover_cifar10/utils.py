@@ -119,9 +119,42 @@ class EMA(object):
             self.value = self.alpha * self.value + (1 - self.alpha) * x
 
 
+def _load_cluster_stats_for_layer(cluster_stat_path, hook_subdir, num_classes, name,
+                                   ipc, keys, gpu):
+    """Load per-class per-cluster stats for a single layer and pad to [num_classes, ipc, ...].
+
+    Each .npz under {cluster_stat_path}/{hook_subdir}/class_{c}/{name}/cluster_running.npz
+    holds tensors with leading dim n_clusters_c (<= ipc). We pad the leading
+    dim to `ipc` with zeros — the manifest's ipc_to_cluster map ensures padded
+    rows are never indexed at recover-time.
+
+    Returns dict[key -> Tensor on cuda(gpu)] or None if any file is missing
+    (caller decides whether to raise).
+    """
+    stacked = {k: [] for k in keys}
+    for c in range(num_classes):
+        path = os.path.join(cluster_stat_path, hook_subdir, f"class_{c}", name, "cluster_running.npz")
+        if not os.path.exists(path):
+            return None, path
+        npz = np.load(path)
+        for k in keys:
+            arr = npz[k]
+            n_c = arr.shape[0]
+            if n_c > ipc:
+                arr = arr[:ipc]
+            elif n_c < ipc:
+                pad_shape = (ipc - n_c,) + arr.shape[1:]
+                arr = np.concatenate([arr, np.zeros(pad_shape, dtype=arr.dtype)], 0)
+            stacked[k].append(torch.from_numpy(arr).float())
+    out = {k: torch.stack(stacked[k], 0).cuda(gpu) for k in keys}  # [num_classes, ipc, ...]
+    return out, None
+
+
 class BNFeatureHook():
     def __init__(self, module, save_path="./", training_momentum=0.4, name=None, gpu=0, flatness_weight=0,
-                      category_aware = 'global', class_num_list=None, num_classes=10, enable_struct=False):
+                      category_aware = 'global', class_num_list=None, num_classes=10, enable_struct=False,
+                      cluster_stat_path=None, ipc_to_cluster=None,
+                      cluster_loss_weight=0.0):
         self.module = module
         if module is not None and name is not None:
             self.hook = module.register_forward_hook(self.post_hook_fn)
@@ -139,6 +172,27 @@ class BNFeatureHook():
         self.loss_global_var = torch.tensor(0.)
         self.loss_class_mean = torch.tensor(0.)
         self.loss_class_var = torch.tensor(0.)
+        self.loss_cluster_mean = torch.tensor(0.)
+        self.loss_cluster_var = torch.tensor(0.)
+
+        # Cluster matching state
+        self.cluster_loss_weight = float(cluster_loss_weight)
+        self.ipc_to_cluster = ipc_to_cluster.cuda(gpu) if ipc_to_cluster is not None else None
+        self.cluster_dd_mean = None
+        self.cluster_dd_var = None
+        self.ipc_ids = None
+        if cluster_stat_path is not None and self.cluster_loss_weight > 0:
+            ipc = ipc_to_cluster.shape[1]
+            loaded, missing_path = _load_cluster_stats_for_layer(
+                cluster_stat_path, "BNFeatureHook", num_classes, name, ipc,
+                keys=['cluster_dd_mean', 'cluster_dd_var'], gpu=gpu,
+            )
+            if loaded is None:
+                raise FileNotFoundError(
+                    f"BNFeatureHook cluster stat file missing for layer '{name}': {missing_path}"
+                )
+            self.cluster_dd_mean = loaded['cluster_dd_mean']  # [num_classes, ipc, C]
+            self.cluster_dd_var = loaded['cluster_dd_var']
 
         for i in range(10):
             cls_dir = os.path.join(save_path, f"BNFeatureHook", f"class_{i}", name)
@@ -193,12 +247,15 @@ class BNFeatureHook():
     def set_tea(self):
         self.tea_tag = True
 
-    def set_label(self,targets):
+    def set_label(self, targets, ipc_ids=None):
         """
         targets: (B,)
-        This function used to acquire the category information within this batch.
+        ipc_ids: (B,) optional — selected synthetic image index inside the class.
+            Required when cluster_loss_weight > 0 so the hook can map (class, ipc_id)
+            to the corresponding KMeans cluster_id via ipc_to_cluster.
         """
         self.targets = targets
+        self.ipc_ids = ipc_ids
 
     def set_hook(self, pre=True):
         if hasattr(self, "hook"):
@@ -281,6 +338,24 @@ class BNFeatureHook():
             self.loss_class_mean = loss_class_mean.detach() if isinstance(loss_class_mean, torch.Tensor) else torch.tensor(float(loss_class_mean))
             self.loss_class_var = loss_class_var.detach() if isinstance(loss_class_var, torch.Tensor) else torch.tensor(float(loss_class_var))
 
+            if (self.cluster_loss_weight > 0
+                    and self.cluster_dd_mean is not None
+                    and self.ipc_to_cluster is not None
+                    and self.ipc_ids is not None):
+                batch_cls = self.targets.long()
+                batch_ipc = self.ipc_ids.long()
+                batch_cluster = self.ipc_to_cluster[batch_cls, batch_ipc]  # [B]
+                tgt_dd_mean = self.cluster_dd_mean[batch_cls, batch_cluster].mean(0)  # [C]
+                tgt_dd_var = self.cluster_dd_var[batch_cls, batch_cluster].mean(0)
+                loss_cluster_mean = torch.norm(tgt_dd_mean - syn_mean, 2)
+                loss_cluster_var = torch.norm(tgt_dd_var - syn_var, 2)
+                r_feature = r_feature + self.cluster_loss_weight * 0.5 * (loss_cluster_mean + loss_cluster_var)
+                self.loss_cluster_mean = loss_cluster_mean.detach()
+                self.loss_cluster_var = loss_cluster_var.detach()
+            else:
+                self.loss_cluster_mean = torch.tensor(0., device=input_0.device)
+                self.loss_cluster_var = torch.tensor(0., device=input_0.device)
+
             if self.enable_struct and hasattr(self, "real_G_norm"):
                 feat = input_0.mean([2, 3])  # [B, nch]
                 one_hot = F.one_hot(self.targets.long(), self.num_classes).to(feat.dtype)
@@ -310,7 +385,9 @@ import collections
 class ConvFeatureHook():
     def __init__(self, module=None, save_path="./", data_number=50000, name=None, gpu=0, training_momentum=0.4,
                  drop_rate=0.4, flatness_weight=0, category_aware = 'global', class_num_list=None,
-                 num_classes=10, enable_struct=False):
+                 num_classes=10, enable_struct=False,
+                 cluster_stat_path=None, ipc_to_cluster=None,
+                 cluster_loss_weight=0.0):
         self.counter = collections.defaultdict(int)
         self.module = module
         if module is not None and name is not None:
@@ -338,6 +415,33 @@ class ConvFeatureHook():
         self.loss_class_mean = torch.tensor(0.)
         self.loss_class_var = torch.tensor(0.)
         self.loss_bdpc = torch.tensor(0.)
+        self.loss_cluster_mean = torch.tensor(0.)
+        self.loss_cluster_var = torch.tensor(0.)
+
+        # Cluster matching state
+        self.cluster_loss_weight = float(cluster_loss_weight)
+        self.ipc_to_cluster = ipc_to_cluster.cuda(gpu) if ipc_to_cluster is not None else None
+        self.cluster_dd_mean = None
+        self.cluster_dd_var = None
+        self.cluster_patch_mean = None
+        self.cluster_patch_var = None
+        self.ipc_ids = None
+        if cluster_stat_path is not None and self.cluster_loss_weight > 0:
+            ipc = ipc_to_cluster.shape[1]
+            loaded, missing_path = _load_cluster_stats_for_layer(
+                cluster_stat_path, "ConvFeatureHook", num_classes, name, ipc,
+                keys=['cluster_dd_mean', 'cluster_dd_var',
+                      'cluster_patch_mean', 'cluster_patch_var'],
+                gpu=gpu,
+            )
+            if loaded is None:
+                raise FileNotFoundError(
+                    f"ConvFeatureHook cluster stat file missing for layer '{name}': {missing_path}"
+                )
+            self.cluster_dd_mean = loaded['cluster_dd_mean']        # [num_classes, ipc, C]
+            self.cluster_dd_var = loaded['cluster_dd_var']
+            self.cluster_patch_mean = loaded['cluster_patch_mean']  # [num_classes, ipc, num_patches]
+            self.cluster_patch_var = loaded['cluster_patch_var']
         
         self.bias_dir_dd_mean_f1 = None       # (C,) global
         self.bias_dir_dd_var_f1 = None        # (C,)
@@ -423,8 +527,9 @@ class ConvFeatureHook():
     def set_tea(self):
         self.tea_tag = True
 
-    def set_label(self,targets):
+    def set_label(self, targets, ipc_ids=None):
         self.targets = targets
+        self.ipc_ids = ipc_ids
 
     def set_bias_direction(self, dd_mean_f1, dd_var_f1, patch_mean_f1, patch_var_f1,
                            cls_dd_mean, cls_dd_var, cls_patch_mean, cls_patch_var):
@@ -578,6 +683,28 @@ class ConvFeatureHook():
             self.loss_global_var = loss_global_var.detach()
             self.loss_class_mean = loss_class_mean.detach() if isinstance(loss_class_mean, torch.Tensor) else torch.tensor(float(loss_class_mean))
             self.loss_class_var = loss_class_var.detach() if isinstance(loss_class_var, torch.Tensor) else torch.tensor(float(loss_class_var))
+
+            if (self.cluster_loss_weight > 0
+                    and self.cluster_dd_mean is not None
+                    and self.ipc_to_cluster is not None
+                    and self.ipc_ids is not None):
+                batch_cls = self.targets.long()
+                batch_ipc = self.ipc_ids.long()
+                batch_cluster = self.ipc_to_cluster[batch_cls, batch_ipc]  # [B]
+                tgt_dd_mean = self.cluster_dd_mean[batch_cls, batch_cluster].mean(0)
+                tgt_dd_var = self.cluster_dd_var[batch_cls, batch_cluster].mean(0)
+                tgt_patch_mean = self.cluster_patch_mean[batch_cls, batch_cluster].mean(0)
+                tgt_patch_var = self.cluster_patch_var[batch_cls, batch_cluster].mean(0)
+                loss_cluster_mean = (torch.norm(tgt_dd_mean - syn_dd_mean, 2)
+                                     + torch.norm(tgt_patch_mean - syn_patch_mean, 2))
+                loss_cluster_var = (torch.norm(tgt_dd_var - syn_dd_var, 2)
+                                    + torch.norm(tgt_patch_var - syn_patch_var, 2))
+                r_feature = r_feature + self.cluster_loss_weight * 0.5 * (loss_cluster_mean + loss_cluster_var)
+                self.loss_cluster_mean = loss_cluster_mean.detach()
+                self.loss_cluster_var = loss_cluster_var.detach()
+            else:
+                self.loss_cluster_mean = torch.tensor(0., device=input_0.device)
+                self.loss_cluster_var = torch.tensor(0., device=input_0.device)
 
             if self.bdpc_beta > 0:
                 # form1: global bias direction

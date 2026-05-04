@@ -192,7 +192,6 @@ def get_default_convnet_setting():
 
 
 def get_network(model, channel, num_classes, im_size=(32, 32), dist=True):
-    torch.random.manual_seed(int(time.time() * 1000) % 100000)
     net_width, net_depth, net_act, net_norm, net_pooling = get_default_convnet_setting()
 
     if model == 'MLP':

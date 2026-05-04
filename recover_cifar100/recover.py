@@ -33,6 +33,35 @@ from baseline import get_network as ti_get_network
 
 faulthandler.enable(all_threads=True)
 
+
+def seed_everything(seed):
+    if seed is None:
+        return
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def make_generator(seed, offset=0):
+    if seed is None:
+        return None
+    generator = torch.Generator()
+    generator.manual_seed(int(seed) + int(offset))
+    return generator
+
+
 def convnet3(nclass, logger=None):
     width = int(128)
     model = ConvNet(nclass,
@@ -44,6 +73,28 @@ def convnet3(nclass, logger=None):
     if logger is not None:
         logger(f"=> creating model convnet-3, norm: instance")
     return model
+
+
+def build_cifar_model(arch_name, num_classes):
+    if arch_name == "convnet":
+        return convnet3(nclass=num_classes)
+    if arch_name == "resnet18":
+        return ResNet_cifar.resnet18(num_class=num_classes)
+    if arch_name == "resnet32":
+        return ResNet_cifar.resnet32(num_class=num_classes)
+    if arch_name == "resnet34":
+        return ResNet_cifar.resnet34(num_class=num_classes)
+    raise ValueError(
+        f"Unsupported teacher arch '{arch_name}'. "
+        "Supported values: convnet, resnet18, resnet32, resnet34"
+    )
+
+
+def load_checkpoint_state_dict(path):
+    checkpoint = torch.load(path, map_location="cpu")
+    state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
+    return {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+
 
 class ApplyTransformToPair:
     def __init__(self, transform):
@@ -70,6 +121,8 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier, ipc_id
         args.rank = 0
     
     torch.cuda.set_device(args.gpu)
+    worker_seed = int(args.seed) + int(args.rank)
+    seed_everything(worker_seed)
     model_teacher = [_model_teacher.cuda(gpu).eval() for _model_teacher in model_teacher]
 
     for _model_teacher in model_teacher:
@@ -164,7 +217,9 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier, ipc_id
                                                    num_workers=4,
                                                    batch_size=64,
                                                    drop_last=False,
-                                                   shuffle=True)
+                                                   shuffle=True,
+                                                   worker_init_fn=seed_worker,
+                                                   generator=make_generator(args.seed, args.rank * 1000))
         
         with torch.no_grad():
             for j, _model_teacher in enumerate(model_teacher):
@@ -471,19 +526,13 @@ def prepare_biased_statistics(args):
       - BN layer running_mean/var     → .../BNFeatureHook/{name}/bn_running.npz
     """
     gpu = 0
-    aux_teacher = ["convnet"]
+    aux_teacher = [args.arch_name]
 
     # --- build biased model ---
-    biased_model = convnet3(nclass=100)
+    biased_model = build_cifar_model(args.arch_name, num_classes=100)
 
     # --- load biased checkpoint ---
-    checkpoint = torch.load(args.biased_expert_path, map_location="cpu")
-    from collections import OrderedDict
-    state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
-    new_state_dict = OrderedDict()
-    for k, v in state_dict.items():
-        new_state_dict[k.replace("module.", "")] = v
-    biased_model.load_state_dict(new_state_dict)
+    biased_model.load_state_dict(load_checkpoint_state_dict(args.biased_expert_path))
     biased_model = biased_model.cuda(gpu).eval()
     for p in biased_model.parameters():
         p.requires_grad = False
@@ -533,7 +582,8 @@ def prepare_biased_statistics(args):
             imbanlance_rate=args.imbanlance_rate, train=True, file_path=args.train_data_path)
 
         train_loader = torch.utils.data.DataLoader(
-            train_dataset, num_workers=0, batch_size=64, drop_last=False, shuffle=True)
+            train_dataset, num_workers=0, batch_size=64, drop_last=False, shuffle=True,
+            worker_init_fn=seed_worker, generator=make_generator(args.seed, 5000))
 
         print("[BDPC] Collecting biased expert statistics...")
         with torch.no_grad():
@@ -650,9 +700,12 @@ def main_syn():
                         help='wandb API key')
     parser.add_argument('--wandb-run-name', type=str, default=None,
                         help='wandb run name prefix (defaults to --exp-name)')
+    parser.add_argument('--seed', default=42, type=int,
+                        help='seed for Python, NumPy, PyTorch, CUDA, and DataLoader workers')
     args = parser.parse_args()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+    seed_everything(args.seed)
 
     if args.bdpc_beta > 0:
         print(f"BDPC enabled with beta={args.bdpc_beta}, preparing biased statistics...")
@@ -673,31 +726,13 @@ def main_syn():
         json.dump({k: (v if isinstance(v, (int, float, str, bool, list, dict, type(None))) else str(v))
                    for k, v in vars(args).items()}, _f, indent=2)
 
-    aux_teacher = ["convnet"]
+    aux_teacher = [args.arch_name]
     args.aux_teacher = aux_teacher
     model_teacher = []
     for name in aux_teacher:
-        if name == "resnet32":
-            model = ResNet_cifar.resnet32(num_class=100)
-        elif name == "convnet":
-            model = convnet3(nclass=100)
-        elif name in ["ConvNetW128","ConvNetD1","ConvNetD2","ConvNetW32"]:
-            model = ti_get_network(name, channel=3, num_classes=100, im_size=(32, 32), dist=False)
-        else:
-            model = ti_models.model_dict[name](num_classes=100)
+        model = build_cifar_model(name, num_classes=100)
+        model.load_state_dict(load_checkpoint_state_dict(args.pre_train_path))
         model_teacher.append(model)
-        if name == "resnet32":
-            checkpoint = torch.load(os.path.join(args.pre_train_path, f".ptn"),map_location="cpu")
-            model_teacher[-1].load_state_dict(checkpoint['state_dict'])
-        elif name == "convnet":
-            checkpoint = torch.load(args.pre_train_path, map_location="cpu")
-            state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
-            # 2. Strip module prefixes
-            new_state_dict = {}
-            for k, v in state_dict.items():
-                name = k.replace("module.", "")  # remove `module.` 
-                new_state_dict[name] = v
-            model.load_state_dict(new_state_dict)
 
     model_verifier = model_teacher[0]
     ipc_id_range = list(range(0, args.ipc_number))
